@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset
+  xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://www.sitemaps.org/schemas/sitemap/0.9 http://www.sitemaps.org/schemas/sitemap/0.9/sitemap.xsd"
+>
+  <!-- Created and updated for BookYourNeed multi-app platform -->
+  
+  <!-- 🌐 Main Website -->
+  <url>
+    <loc>https://bookyourneed.com/</loc>
+    <priority>1.00</priority>
+    <changefreq>daily</changefreq>
+  </url>
+
+  <url>
+    <loc>https://bookyourneed.com/about</loc>
+    <priority>0.9</priority>
+    <changefreq>weekly</changefreq>
+  </url>
+
+  <url>
+    <loc>https://bookyourneed.com/contact</loc>
+    <priority>0.9</priority>
+    <changefreq>weekly</changefreq>
+  </url>
+
+  <url>
+    <loc>https://bookyourneed.com/services</loc>
+    <priority>0.9</priority>
+    <changefreq>weekly</changefreq>
+  </url>
+
+  <url>
+    <loc>https://bookyourneed.com/privacy-policy</loc>
+    <priority>0.5</priority>
+    <changefreq>monthly</changefreq>
+  </url>
+
+  <url>
+    <loc>https://bookyourneed.com/terms</loc>
+    <priority>0.5</priority>
+    <changefreq>monthly</changefreq>
+  </url>
+
+
+  <!-- 👥 Customer App -->
+  <url>
+    <loc>https://app.bookyourneed.com/</loc>
+    <priority>0.9</priority>
+    <changefreq>daily</changefreq>
+  </url>
+  <url>
+    <loc>https://app.bookyourneed.com/login</loc>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://app.bookyourneed.com/signup</loc>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://app.bookyourneed.com/help</loc>
+    <priority>0.7</priority>
+  </url>
+
+
+  <!-- 🔧 Worker App -->
+  <url>
+    <loc>https://worker.bookyourneed.com/</loc>
+    <priority>0.9</priority>
+    <changefreq>daily</changefreq>
+  </url>
+  <url>
+    <loc>https://worker.bookyourneed.com/login</loc>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://worker.bookyourneed.com/signup</loc>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://worker.bookyourneed.com/help</loc>
+    <priority>0.7</priority>
+  </url>
+
+</urlset>
