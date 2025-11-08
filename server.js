@@ -1,167 +1,198 @@
-// ✅ Final server.js for BYN Backend (Fully Working & Clean)
 require("dotenv").config();
 const express = require("express");
 const http = require("http");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
-const socketIo = require("socket.io");
 const webpush = require("web-push");
 const bcrypt = require("bcrypt");
+const multer = require("multer");
+const path = require("path");
+const socketio = require("socket.io");
+const cron = require("node-cron");
+const axios = require("axios");
+// ✅ Initialize email transporter at startup
+require("./emailService");
 
 const app = express();
 const server = http.createServer(app);
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+// ✅ Socket Setup
+const { initSocket } = require("./socket");
+const io = initSocket(server);
+app.set("socketio", io);
 
-// ✅ Enable Socket.io
-const io = socketIo(server, {
-  cors: {
-    origin: [
-      "http://localhost:3000",
-      "http://localhost:3001",
-      "http://localhost:3002",
-      "https://bookyourneed.com",
-      "https://www.bookyourneed.com"
-    ],
-    methods: ["GET", "POST"],
-    credentials: true,
-  },
+// ✅ Multer Setup
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, "uploads/"),
+  filename: (req, file, cb) => cb(null, Date.now() + path.extname(file.originalname)),
 });
+const upload = multer({ storage });
 
-// ✅ Middleware
+// ✅ CORS — allow only your live domains
 app.use(cors({
   origin: [
-    "http://localhost:3000",
-    "http://localhost:3001",
-    "http://localhost:3002",
     "https://bookyourneed.com",
-    "https://www.bookyourneed.com"
+    "https://worker.bookyourneed.com",
+    "https://admin.bookyourneed.com",
+    "https://api.bookyourneed.com",
+    "https://app.bookyourneed.com",
+    "http://localhost:3000" // for local testing
   ],
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   credentials: true,
 }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use("/uploads", express.static("uploads")); // Serve uploaded files
 
-// ✅ MongoDB Models
+
+// ✅ Allow larger upload payloads
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+
+// ✅ Increase upload size limit (413 fix)
 const User = require("./models/User");
 const Worker = require("./models/Worker");
 const Job = require("./models/Job");
+const Chat = require("./models/Chat");
+const BookingRequest = require("./models/BookingRequest");
 
 // ✅ Routes
-const userRoutes = require("./routes/user");
-const jobRoutes = require("./routes/jobs");
-const workerRoutes = require("./routes/Worker");
-const reviewRoutes = require("./routes/review");
-const adminRoutes = require("./routes/admin");
+app.use("/api/customers", require("./routes/user"));
+app.use("/api/customers/jobs", require("./routes/jobs"));
+app.use("/api/worker", require("./routes/Worker"));
+app.use("/api/review", require("./routes/review"));
+app.use("/api/admin", require("./routes/admin"));
+app.use("/api/chat", require("./routes/chat"));
+app.use("/api/ride", require("./routes/ride"));
+app.use("/api/booking", require("./routes/booking"));
+app.use("/api/ride-chat", require("./routes/rideChat"));
+app.use("/api/ridepayment", require("./routes/ridepayment"));
+app.use("/api/ride-booking", require("./routes/customerridebooking"));
+app.use("/api/notification", require("./routes/notification"));
+app.use("/api/worker/job", require("./routes/workerJobs"));
 
-app.use("/api/user", userRoutes);
-app.use("/api", jobRoutes);
-app.use("/api/worker", workerRoutes);
-app.use("/api/review", reviewRoutes);
-app.use("/api/admin", adminRoutes);
+// ✅ Payment & Wallet Routes
+const paymentRoutes = require("./routes/payment");
+app.use("/api/payment", paymentRoutes);
+const workerWalletRoutes = require("./routes/workerWallet");
+app.use("/api/worker", workerWalletRoutes);
+const stripeConnectRoutes = require("./routes/stripeConnect");
+app.use("/api/stripe", stripeConnectRoutes);
 
-// ✅ JWT Secret
-const SECRET_KEY = process.env.SECRET_KEY || "default_secret_key";
-
-// ✅ Combined Login
-app.post("/api/user/login", async (req, res) => {
-  const { email, password } = req.body;
+// ✅ Profile Picture Upload
+app.post("/api/user/upload-profile-picture", upload.single("profilePicture"), async (req, res) => {
+  const { email } = req.body;
+  if (!req.file) return res.status(400).json({ message: "No file uploaded" });
 
   try {
-    let worker = await Worker.findOne({ email });
-    if (worker) {
-      if (!worker.password) return res.status(400).json({ message: "No password set for this worker." });
-      const isMatch = await bcrypt.compare(password, worker.password);
-      if (!isMatch) return res.status(401).json({ message: "Incorrect password." });
-
-      const token = jwt.sign({ email }, SECRET_KEY, { expiresIn: "2h" });
-      return res.status(200).json({ token, _id: worker._id, email, profileCompleted: worker.profileCompleted });
-    }
-
-    const user = await User.findOne({ email });
-    if (!user) return res.status(404).json({ message: "User not found." });
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return res.status(401).json({ message: "Incorrect password." });
-
-    const token = jwt.sign({ email }, SECRET_KEY, { expiresIn: "2h" });
-    return res.status(200).json({ token, _id: user._id, email });
-  } catch (err) {
-    console.error("Login error:", err);
-    res.status(500).json({ message: "Server error" });
-  }
-});
-
-// ✅ Worker Notification via Socket.io
-let connectedWorkers = {};
-io.on("connection", (socket) => {
-  console.log("✅ Worker connected:", socket.id);
-
-  socket.on("register-worker", (workerId) => {
-    connectedWorkers[workerId] = socket.id;
-    console.log(`🛠️ Worker ${workerId} registered`);
-  });
-
-  socket.on("disconnect", () => {
-    const disconnectedId = Object.keys(connectedWorkers).find(
-      (id) => connectedWorkers[id] === socket.id
+    const profilePicturePath = `/uploads/${req.file.filename}`;
+    const user = await User.findOneAndUpdate(
+      { email },
+      { profilePicture: profilePicturePath },
+      { new: true }
     );
-    if (disconnectedId) {
-      delete connectedWorkers[disconnectedId];
-      console.log(`❌ Worker ${disconnectedId} disconnected`);
-    }
-  });
-});
+    if (!user) return res.status(404).json({ message: "User not found" });
 
-// ✅ Job Posting + Real-time Notify
-app.post("/api/jobs/post", async (req, res) => {
-  try {
-    const newJob = new Job(req.body);
-    await newJob.save();
-
-    const workers = await Worker.find({
-      services: { $elemMatch: { name: newJob.jobTitle } },
-      status: "approved",
+    res.status(200).json({
+      message: "Profile picture uploaded",
+      profilePicture: user.profilePicture,
     });
-
-    workers.forEach((worker) => {
-      const socketId = connectedWorkers[worker._id];
-      if (socketId) {
-        io.to(socketId).emit("new-job", {
-          jobId: newJob._id,
-          jobTitle: newJob.jobTitle,
-          description: newJob.description,
-          budget: newJob.budget,
-        });
-      }
-    });
-
-    res.status(200).json({ message: "Job posted & workers notified!", jobId: newJob._id });
-  } catch (err) {
-    console.error("Job post error:", err);
-    res.status(500).json({ error: "Job creation failed" });
+  } catch (error) {
+    console.error("Upload profile picture error:", error);
+    res.status(500).json({ message: "Failed to upload profile picture" });
   }
 });
 
 // ✅ Web Push Setup
 webpush.setVapidDetails(
-  "mailto:your-email@gmail.com",
+  "mailto:admin@bookyourneed.com",
   process.env.VAPID_PUBLIC_KEY,
   process.env.VAPID_PRIVATE_KEY
 );
 
-// ✅ Health Check Route
+// ✅ Health Check
 app.get("/api/health-check", (req, res) => {
   res.json({ status: "✅ Backend is healthy!" });
 });
 
 // ✅ MongoDB Connect
 mongoose
-  .connect(process.env.MONGODB_URI)
+  .connect(process.env.MONGO_URI)
   .then(() => console.log("✅ MongoDB connected"))
   .catch((err) => console.error("❌ MongoDB error:", err));
 
+// =====================================================
+// 🕒 Cron Jobs
+// =====================================================
+
+// ✅ Auto-refund expired jobs every hour
+cron.schedule("0 * * * *", async () => {
+  console.log("⏳ Running auto-refund for expired unassigned jobs...");
+  try {
+    const results = await refundExpiredJobs();
+    if (results.length > 0) console.log(`✅ Auto-refunded ${results.length} jobs`, results);
+    else console.log("ℹ️ No expired jobs to refund this run");
+  } catch (err) {
+    console.error("❌ Cron auto-refund failed:", err);
+  }
+});
+
+// ✅ Auto-release ride payments every 3 hours
+cron.schedule("0 */3 * * *", async () => {
+  console.log("🚗 Running auto-release for completed rides...");
+  try {
+    await axios.post(`https://api.bookyourneed.com/api/ridepayment/auto-complete`);
+    console.log("✅ Ride auto-release check completed successfully");
+  } catch (err) {
+    console.error("❌ Ride auto-release cron failed:", err.message);
+  }
+});
+
+// =========================
+// ✅ TEST EMAIL ROUTE
+// =========================
+const { sendEmailSafe } = require("./emailService");
+
+app.get("/api/test-email", async (req, res) => {
+  try {
+    await sendEmailSafe({
+      to: "youremail@gmail.com", // <— put your real email here
+      subject: "BYN Brevo Test 🚀",
+      html: `<p>Hello from <b>Book Your Need</b> Brevo API integration!</p>`,
+      context: "test-email",
+    });
+    res.json({ success: true, message: "Test email sent ✅" });
+  } catch (err) {
+    console.error("❌ Test email failed:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ✅ Cleanup completed rides daily at 2 AM
+cron.schedule("0 2 * * *", async () => {
+  console.log("🧹 Running cleanup for completed rides...");
+  try {
+    await axios.post(`https://api.bookyourneed.com/api/ridepayment/cleanup-completed`);
+    console.log("✅ Completed rides cleaned up successfully");
+  } catch (err) {
+    console.error("❌ Cleanup cron failed:", err.message);
+  }
+});
+
+// 🕓 Daily cleanup of refunded bookings older than 72h
+setInterval(async () => {
+  const cutoff = new Date(Date.now() - 72 * 60 * 60 * 1000);
+  try {
+    const result = await BookingRequest.deleteMany({
+      status: "refunded",
+      updatedAt: { $lt: cutoff },
+    });
+    if (result.deletedCount > 0)
+      console.log(`🧹 Cleaned ${result.deletedCount} old refunded bookings`);
+  } catch (err) {
+    console.error("Refund cleanup error:", err.message);
+  }
+}, 24 * 60 * 60 * 1000);
+
 // ✅ Start Server
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, "0.0.0.0", () =>
-  console.log(`🚀 Server running on port ${PORT}`)
-);
+server.listen(PORT, "0.0.0.0", () => console.log(`🚀 Server running on port ${PORT}`));

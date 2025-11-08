@@ -1,14 +1,187 @@
-// routes/user.js
+require("dotenv").config();
 const express = require("express");
 const router = express.Router();
 const bcrypt = require("bcrypt");
 const User = require("../models/User");
 const nodemailer = require("nodemailer");
+const multer = require("multer");
+const path = require("path");
+
+const jwt = require("jsonwebtoken");
+const SECRET_KEY = process.env.SECRET_KEY || "default_secret_key";
 const crypto = require("crypto");
+// ✅ Use the universal safe email fallback
+const emailService = require("../emailService");
+const sendEmailSafe = emailService.sendEmailSafe || emailService.sendSafe || (() => {});
+const sendEmail = sendEmailSafe;
 
-// In-memory store for email OTPs (can move to Redis/DB later)
-let otpStore = {};
+const fs = require("fs");
 
+// ✅ Multer setup with auto-folder creation
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const dir = "uploads/profile-pictures";
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true }); // auto-create folders
+    }
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => {
+    cb(null, `profile-${Date.now()}${path.extname(file.originalname)}`);
+  },
+});
+
+const upload = multer({ storage });
+
+
+
+// ✅ Get user by Mongo ID
+router.get("/:id", async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ error: "User not found" });
+    res.json(user);
+  } catch (err) {
+    console.error("❌ Failed to get user:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ✅ User Signup
+router.post("/signup", async (req, res) => {
+  const { email, password } = req.body;
+
+  try {
+    if (!email || !password)
+      return res.status(400).json({ message: "Missing fields" });
+
+    const exists = await User.findOne({ email });
+    if (exists)
+      return res.status(409).json({ message: "Email already exists" });
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const newUser = new User({
+      email,
+      password: hashedPassword,
+      profileCompleted: false,
+    });
+
+    await newUser.save();
+
+    // ✅ Send Welcome Email
+    try {
+      await sendEmailSafe({
+        to: email,
+        subject: "🎉 Welcome to Book Your Need!",
+        html: `
+          <h2>Welcome to Book Your Need,</h2>
+          <p>Thank you for signing up! You can now book trusted professionals for services anytime.</p>
+          <p>Start by completing your profile and posting your first job.</p>
+          <br>
+          <p>Need help? Reach out to our support team anytime.</p>
+          <p>— The BYN Team</p>
+        `,
+      });
+      console.log("✅ Welcome email sent to:", email);
+    } catch (emailErr) {
+      console.error("❌ Failed to send welcome email:", emailErr.message);
+    }
+
+    const token = jwt.sign({ userId: newUser._id }, SECRET_KEY, {
+      expiresIn: "2h",
+    });
+
+    return res.status(201).json({
+      message: "Signup successful",
+      token,
+      _id: newUser._id,
+      email,
+      profileCompleted: false,
+    });
+  } catch (err) {
+    console.error("Signup error:", err);
+    return res.status(500).json({ message: "Signup failed" });
+  }
+});
+
+
+// ✅ Login (email + password)
+router.post("/login", async (req, res) => {
+  const { email, password } = req.body;
+  try {
+    const user = await User.findOne({ email });
+    if (!user)
+      return res.status(404).json({ message: "User not found." });
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch)
+      return res.status(401).json({ message: "Incorrect password." });
+
+    const token = jwt.sign({ userId: user._id }, SECRET_KEY, { expiresIn: "2h" });
+
+    return res.status(200).json({ token, _id: user._id, email });
+  } catch (err) {
+    console.error("Login error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+// ✅ Google Login
+router.post("/google-login", async (req, res) => {
+  const { name, email, googleId } = req.body;
+
+  try {
+    let user = await User.findOne({ email });
+    const isNewUser = !user;
+
+    if (isNewUser) {
+      user = new User({
+        name,
+        email,
+        googleId,
+        profileCompleted: false,
+      });
+
+      await user.save();
+
+      // ✅ Send Welcome Email
+      try {
+        await sendEmailSafe({
+          to: email,
+          subject: "🎉 Welcome to Book Your Need!",
+          html: `
+            <h2>Welcome to Book Your Need, ${name || "there"}!</h2>
+            <p>Your account has been created using Google.</p>
+            <p>You can now book trusted professionals for any service you need.</p>
+            <br>
+            <p>Need help? Reach out to our support team anytime.</p>
+            <p>— The BYN Team</p>
+          `,
+        });
+        console.log("✅ Welcome email sent to:", email);
+      } catch (emailErr) {
+        console.error("❌ Failed to send welcome email:", emailErr.message);
+      }
+    }
+
+    const token = jwt.sign({ userId: user._id }, SECRET_KEY, {
+      expiresIn: "2h",
+    });
+
+    res.status(200).json({
+      token,
+      _id: user._id,
+      email: user.email,
+      profileCompleted: user.profileCompleted,
+    });
+  } catch (error) {
+    console.error("❌ Google login error:", error);
+    res.status(500).json({ error: "Server error during Google login" });
+  }
+});
+
+// ✅ Send OTP (for email verification or reset)
 router.post("/send-email-otp", async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ message: "Email is required" });
@@ -20,15 +193,14 @@ router.post("/send-email-otp", async (req, res) => {
     if (!user) return res.status(404).json({ message: "User not found" });
 
     user.emailOTP = otp;
-    user.emailOTPExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 min expiry
+    user.emailOTPExpires = new Date(Date.now() + 10 * 60 * 1000);
     await user.save();
 
-    // send email
     const transporter = nodemailer.createTransport({
       service: "gmail",
       auth: {
-        user: process.env.OTP_EMAIL, // your gmail
-        pass: process.env.OTP_PASS,  // your app password
+        user: process.env.OTP_EMAIL,
+        pass: process.env.OTP_PASS,
       },
     });
 
@@ -48,7 +220,6 @@ router.post("/send-email-otp", async (req, res) => {
 
 router.post("/verify-email-otp", async (req, res) => {
   const { email, otp } = req.body;
-
   try {
     const user = await User.findOne({ email });
     if (!user) return res.status(404).json({ message: "User not found" });
@@ -72,56 +243,11 @@ router.post("/verify-email-otp", async (req, res) => {
   }
 });
 
-
-// ✅ Google Login
-router.post("/google-login", async (req, res) => {
-  const { name, email, googleId } = req.body;
-
-  try {
-    let user = await User.findOne({ email });
-
-    if (!user) {
-      user = new User({ name, email, googleId, profileCompleted: false });
-      await user.save();
-    }
-
-    res.status(200).json({ profileCompleted: user.profileCompleted });
-  } catch (error) {
-    console.error("❌ Google login error:", error);
-    res.status(500).json({ error: "Server error during Google login" });
-  }
-});
-
-// ✅ Email/Password Signup
-router.post("/signup", async (req, res) => {
-  const { email, password } = req.body;
-
-  try {
-    if (!email || !password) {
-      return res.status(400).json({ message: "Missing fields" });
-    }
-
-    const exists = await User.findOne({ email });
-    if (exists) {
-      return res.status(409).json({ message: "Email already exists" });
-    }
-
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const newUser = new User({ email, password: hashedPassword, profileCompleted: false });
-    await newUser.save();
-
-    return res.status(201).json({ message: "Signup successful", profileCompleted: false });
-  } catch (err) {
-    console.error("Signup error:", err);
-    return res.status(500).json({ message: "Signup failed" });
-  }
-});
-
-// ✅ Save phone after Firebase OTP verification
+// ✅ Save phone number
 router.post("/save-phone", async (req, res) => {
   const { email, phone } = req.body;
 
-  if (!email || !phone || !email.includes("@")) {
+  if (!email || !phone) {
     return res.status(400).json({ message: "Invalid email or phone" });
   }
 
@@ -132,14 +258,10 @@ router.post("/save-phone", async (req, res) => {
     }
 
     let user = await User.findOne({ email });
+    if (!user) return res.status(404).json({ message: "User not found" });
 
-    if (!user) {
-      user = new User({ email, phone });
-    } else {
-      user.phone = phone;
-    }
+    user.phone = phone;
 
-    // Set profileCompleted if all required fields are filled
     if (user.name && user.lastName && user.address) {
       user.profileCompleted = true;
     }
@@ -152,34 +274,57 @@ router.post("/save-phone", async (req, res) => {
   }
 });
 
-// ✅ Update Name, Address, etc.
+// ✅ Update full profile
 router.post("/update-profile", async (req, res) => {
   const {
-    email, name, lastName, phone,
-    address, street, city, province, postalCode,
+    email,
+    name,
+    lastName,
+    phone,
+    address,
+    street,
+    city,
+    province,
+    postalCode,
+    latitude,
+    longitude,
+    profilePictureSkipped,
+    bio,
+    hobbies,
+    birthday,
   } = req.body;
 
-  const profileCompleted = !!(name && lastName && phone && address);
+  if (!email) return res.status(400).json({ error: "Email is required." });
 
   try {
-    const user = await User.findOneAndUpdate(
-      { email },
-      {
-        name, lastName, phone, address,
-        street, city, province, postalCode,
-        profileCompleted
-      },
-      { new: true }
-    );
+    const user = await User.findOne({ email });
+    if (!user) return res.status(404).json({ error: "User not found." });
 
-    res.status(200).json({ message: "Profile updated successfully!" });
+    if (name !== undefined) user.name = name;
+    if (lastName !== undefined) user.lastName = lastName;
+    if (phone !== undefined) user.phone = phone;
+    if (address !== undefined) user.address = address;
+    if (street !== undefined) user.street = street;
+    if (city !== undefined) user.city = city;
+    if (province !== undefined) user.province = province;
+    if (postalCode !== undefined) user.postalCode = postalCode;
+    if (latitude !== undefined) user.latitude = latitude;
+    if (longitude !== undefined) user.longitude = longitude;
+    if (profilePictureSkipped !== undefined) user.profilePictureSkipped = profilePictureSkipped;
+    if (bio !== undefined) user.bio = bio;
+    if (hobbies !== undefined) user.hobbies = hobbies;
+    if (birthday !== undefined && !user.birthday) user.birthday = birthday;
+
+    await user.save();
+
+    res.json({ success: true, message: "Profile updated", user });
   } catch (err) {
-    console.error("Profile update error:", err);
-    res.status(500).json({ message: "Failed to update profile" });
+    console.error("❌ Profile update error:", err);
+    res.status(500).json({ error: "Server error while updating profile." });
   }
 });
 
-// ✅ Send Email OTP (Forgot Password)
+// ✅ Forgot Password OTP
 router.post("/send-reset-otp", async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ message: "Email is required" });
@@ -205,9 +350,6 @@ router.post("/send-reset-otp", async (req, res) => {
       to: email,
       subject: "Reset Your BYN Password",
       html: `<h3>Your OTP is: ${otp}</h3><p>It expires in 5 minutes.</p>`,
-      headers: {
-        "Content-Type": "text/html"
-      }
     });
 
     res.json({ message: "OTP sent to email" });
@@ -217,7 +359,39 @@ router.post("/send-reset-otp", async (req, res) => {
   }
 });
 
-// ✅ Verify OTP and Reset Password
+router.post("/upload-profile-picture", upload.single("profilePicture"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: "No file uploaded" });
+    }
+
+    const { email } = req.body;
+    if (!email) {
+      return res.status(400).json({ message: "Email is required" });
+    }
+
+    const profilePicturePath = `/uploads/profile-pictures/${req.file.filename}`;
+
+    const user = await User.findOneAndUpdate(
+      { email },
+      { profilePicture: profilePicturePath },
+      { new: true }
+    );
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    res.status(200).json({
+      message: "✅ Profile picture updated",
+      profilePicture: user.profilePicture,
+    });
+  } catch (err) {
+    console.error("❌ Error uploading profile picture:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
 router.post("/verify-reset-otp", async (req, res) => {
   const { email, otp, newPassword } = req.body;
 
@@ -241,7 +415,7 @@ router.post("/verify-reset-otp", async (req, res) => {
   }
 });
 
-// ✅ Get Profile by Email
+// ✅ Get Profile
 router.get("/user-profile/:email", async (req, res) => {
   try {
     const user = await User.findOne({ email: req.params.email });
@@ -254,18 +428,30 @@ router.get("/user-profile/:email", async (req, res) => {
   }
 });
 
-// ✅ Check Phone Uniqueness
-router.post("/check-phone", async (req, res) => {
-  const { phone } = req.body;
+// ✅ Get Profile by ID
+router.get("/profile/:id", async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ message: "User not found" });
+    res.status(200).json(user);
+  } catch (err) {
+    console.error("Profile fetch error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+
+// ✅ Accept Terms
+router.post("/accept-terms", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "Email required" });
 
   try {
-    const existing = await User.findOne({ phone });
-    if (existing) return res.status(409).json({ message: "Phone number already in use" });
-
-    res.status(200).json({ message: "Phone number is available" });
+    await User.findOneAndUpdate({ email }, { termsAccepted: true });
+    res.status(200).json({ success: true });
   } catch (err) {
-    console.error("Check phone error:", err);
-    res.status(500).json({ message: "Server error" });
+    console.error("❌ Accept terms error:", err);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
