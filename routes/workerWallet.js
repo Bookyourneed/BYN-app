@@ -4,39 +4,55 @@ const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const Worker = require("../models/Worker");
 const { sendEmailSafe } = require("../emailService");
 
-// =====================================================
-// ✅ GET Worker Wallet Balance + History + Stats
-// =====================================================
+// ============================================================
+// ✅ GET Worker Wallet + Stats (Final Working Version)
+// ============================================================
 router.get("/wallet/:workerId", async (req, res) => {
   try {
     const { workerId } = req.params;
 
-    const worker = await Worker.findById(workerId).select(
-      "walletBalance walletHistory name email jobsCompleted totalEarnings"
-    );
+    // 🧩 Fetch worker with job titles populated
+    const worker = await Worker.findById(workerId)
+      .populate({
+        path: "walletHistory.jobId",
+        select: "jobTitle",
+      })
+      .select(
+        "walletBalance walletHistory email name jobsCompleted totalEarnings"
+      )
+      .lean();
 
     if (!worker) {
       return res.status(404).json({ error: "Worker not found" });
     }
 
-    // 🧮 Add console check to verify data is being returned
-    console.log("📊 Worker Stats:", {
-      name: worker.name,
-      jobsCompleted: worker.jobsCompleted,
-      totalEarnings: worker.totalEarnings,
-    });
+    // 🧠 Safe fallbacks in case fields are missing
+    const jobsCompleted =
+      typeof worker.jobsCompleted === "number"
+        ? worker.jobsCompleted
+        : (worker.walletHistory || []).filter((h) => h.type === "credit").length;
 
+    const totalEarnings =
+      typeof worker.totalEarnings === "number"
+        ? worker.totalEarnings
+        : (worker.walletHistory || [])
+            .filter((h) => h.type === "credit")
+            .reduce((sum, h) => sum + (h.amount || 0), 0);
+
+    console.log("✅ Wallet Stats:", { jobsCompleted, totalEarnings });
+
+    // 🎯 Final clean response
     res.json({
       walletBalance: worker.walletBalance || 0,
       walletHistory: worker.walletHistory || [],
-      workerName: worker.name,
       workerEmail: worker.email,
-      jobsCompleted: worker.jobsCompleted || 0,
-      totalEarnings: worker.totalEarnings || 0,
+      workerName: worker.name,
+      jobsCompleted,
+      totalEarnings,
     });
   } catch (err) {
-    console.error("❌ Wallet fetch error:", err);
-    res.status(500).json({ error: "Failed to fetch wallet" });
+    console.error("❌ Wallet Fetch Error:", err);
+    res.status(500).json({ error: "Failed to fetch wallet info" });
   }
 });
 
