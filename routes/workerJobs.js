@@ -266,11 +266,15 @@ router.post("/accept-job", async (req, res) => {
   }
 });
 
-// ✅ Worker marks job as complete (with socket)
+// ✅ Worker marks job as complete (with socket + email)
 router.post("/worker-complete/:jobId", async (req, res) => {
   const { jobId } = req.params;
-  const { workerId } = req.body;
+  const { workerId, customerId } = req.body; // ✅ include customerId from frontend
   const io = getIO();
+
+  if (!jobId || !workerId) {
+    return res.status(400).json({ message: "Missing required fields." });
+  }
 
   try {
     const job = await Job.findById(jobId)
@@ -281,13 +285,14 @@ router.post("/worker-complete/:jobId", async (req, res) => {
     if (!job.assignedTo || job.assignedTo._id.toString() !== workerId)
       return res.status(403).json({ message: "Not your job" });
 
-    // 🗓️ Safety: can only mark complete on or after job date
+    // 🗓️ Safety: can only mark complete on or after scheduled date
     const now = new Date();
     const jobDate = new Date(job.scheduledAt);
-    if (now.setHours(0, 0, 0, 0) < jobDate.setHours(0, 0, 0, 0))
+    if (now.setHours(0, 0, 0, 0) < jobDate.setHours(0, 0, 0, 0)) {
       return res.status(400).json({
-        message: "You can only complete on or after the scheduled date.",
+        message: "You can only complete this job on or after the scheduled date.",
       });
+    }
 
     // ✅ Update job
     job.status = "worker_completed";
@@ -304,8 +309,12 @@ router.post("/worker-complete/:jobId", async (req, res) => {
 
     await job.save();
 
-    // ✅ Real-time socket events
-    io.to(`customer_${job.customerId.email}`).emit("job:update", {
+    // =====================================================
+    // ⚡ Real-time socket events (with fallback handling)
+    // =====================================================
+    const customerRoom =
+      job.customerId?.email || `customer_${customerId || job.customerId}`;
+    io.to(customerRoom).emit("job:update", {
       jobId: job._id,
       status: "worker_completed",
       message: `🛠️ ${job.assignedTo.name} marked your job as complete.`,
@@ -317,16 +326,18 @@ router.post("/worker-complete/:jobId", async (req, res) => {
       message: "✅ You marked the job as complete.",
     });
 
-    // ✅ Email notifications
+    // =====================================================
+    // 📧 Email Notifications
+    // =====================================================
     if (job.assignedTo?.email) {
       await sendEmailSafe({
         to: job.assignedTo.email,
-        subject: "✅ Job Completion Confirmed",
+        subject: "✅ Job Completion Recorded",
         html: `
           <h2>Hi ${job.assignedTo.name || "Worker"},</h2>
           <p>You marked job <strong>${job.jobTitle}</strong> as completed.</p>
-          <p>Customer will now review and confirm within 48 hours.</p>
-          <br><p>— Book Your Need</p>
+          <p>The customer has 48 hours to confirm or raise a dispute.</p>
+          <br><p>— Book Your Need Team</p>
         `,
       });
     }
@@ -334,16 +345,19 @@ router.post("/worker-complete/:jobId", async (req, res) => {
     if (job.customerId?.email) {
       await sendEmailSafe({
         to: job.customerId.email,
-        subject: "⚠️ Action Required: Worker Completed Job",
+        subject: "⚠️ Action Required: Worker Completed Your Job",
         html: `
           <h2>Hi ${job.customerId.name || "Customer"},</h2>
           <p>Your worker marked <strong>${job.jobTitle}</strong> as complete.</p>
           <p>Please confirm completion or file a dispute within 48 hours.</p>
-          <br><p>— Book Your Need</p>
+          <br><p>— Book Your Need Team</p>
         `,
       });
     }
 
+    // =====================================================
+    // ✅ Response
+    // =====================================================
     res.json({
       success: true,
       message: "Job marked complete and notifications sent.",

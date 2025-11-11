@@ -194,8 +194,7 @@ router.post("/request-withdrawal", async (req, res) => {
   }
 });
 
-// =====================================================
-// ✅ (Optional) GET All Withdrawal Requests for Admin
+// ✅ GET All Withdrawal Requests (for workers & admin)
 // =====================================================
 router.get("/withdrawal-logs", async (req, res) => {
   try {
@@ -213,6 +212,7 @@ router.get("/withdrawal-logs", async (req, res) => {
           amount: r.amount,
           method: r.notes,
           date: r.date,
+          status: "Sent", // ✅ Add consistent status label
         })
       );
     });

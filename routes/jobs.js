@@ -1,7 +1,7 @@
-<<<<<<< HEAD
+//
 require("dotenv").config(); // ✅ load environment variables first
-=======
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
+//
+//
 const express = require("express");
 const router = express.Router();
 const Job = require("../models/Job");
@@ -13,12 +13,12 @@ const { sendEmailSafe } = require("../emailService");
 const { getIO } = require("../socket"); // ✅ Added for real-time
 
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
-<<<<<<< HEAD
-=======
+//
+//
 
 
 
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
+//
 // 🌍 Distance helper
 const haversine = (lat1, lon1, lat2, lon2) => {
   const R = 6371;
@@ -305,9 +305,9 @@ router.get("/bid/:jobId/:workerId", async (req, res) => {
 // Utility log
 const log = (msg) => console.log("📦 [jobs.js]", msg);
 
-// ============================================================
+// ////////////////====
 // ✅ ACCEPT BID CHANGE (Realtime + Escrow-Safe)
-// ============================================================
+// ////////////////====
 router.post("/bids/change/accept", async (req, res) => {
   const { bidId } = req.body;
   const io = getIO();
@@ -385,9 +385,9 @@ router.post("/bids/change/accept", async (req, res) => {
 });
 
 
-// ============================================================
+// ////////////////====
 // ✅ REJECT BID CHANGE (Realtime)
-// ============================================================
+// ////////////////====
 router.post("/bids/change/reject", async (req, res) => {
   const { bidId } = req.body;
   const io = getIO();
@@ -440,9 +440,9 @@ router.post("/bids/change/reject", async (req, res) => {
   }
 });
 
-// ============================================================
+// ////////////////====
 // ✅ GET JOB DETAILS + BIDS
-// ============================================================
+// ////////////////====
 router.get("/jobs/:jobId", async (req, res) => {
   try {
     const { jobId } = req.params;
@@ -472,9 +472,9 @@ router.get("/jobs/:jobId", async (req, res) => {
   }
 });
 
-// ============================================================
+// ////////////////====
 // ✅ CUSTOMER JOBS (GROUPED)
-// ============================================================
+// ////////////////====
 router.get("/user-jobs/:email", async (req, res) => {
   const { email } = req.params;
 
@@ -526,9 +526,9 @@ router.get("/user-jobs/:email", async (req, res) => {
   }
 });
 
-// ============================================================
+// ////////////////====
 // ✅ FETCH ALL BID CHANGE REQUESTS (Realtime capable)
-// ============================================================
+// ////////////////====
 router.get("/bids/changes/:email", async (req, res) => {
   const { email } = req.params;
 
@@ -609,7 +609,7 @@ router.post("/cancel-job/:jobId", async (req, res) => {
         .json({ message: "Job cannot be cancelled in current state." });
     }
 
-<<<<<<< HEAD
+//
 // ✅ Process Stripe refund safely (with 4.99 deduction logic)
 if (job.stripePaymentIntentId) {
   try {
@@ -643,7 +643,7 @@ if (job.stripePaymentIntentId) {
 } else {
   console.warn("⚠️ No stripePaymentIntentId for this job");
 }
-=======
+//
     // ✅ Process Stripe refund safely
     if (job.stripePaymentIntentId) {
       try {
@@ -674,7 +674,7 @@ if (job.stripePaymentIntentId) {
     } else {
       console.warn("⚠️ No stripePaymentIntentId for this job");
     }
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
+//
 
     // ✅ Update DB (use findByIdAndUpdate since we used lean)
     const updatedJob = await Job.findByIdAndUpdate(
@@ -888,9 +888,9 @@ router.post("/accept-bid", async (req, res) => {
     await job.save();
     console.log("✅ Job assigned:", job._id);
 
-    /* ========================================================= */
+    /* ////////////////= */
     /* ⚡ SOCKET.IO REAL-TIME EMITS                              */
-    /* ========================================================= */
+    /* ////////////////= */
     try {
       const io = getIO();
 
@@ -929,9 +929,9 @@ router.post("/accept-bid", async (req, res) => {
       console.error("⚠️ Socket emit failed:", socketErr.message);
     }
 
-    /* ========================================================= */
+    /* ////////////////= */
     /* 📧 EMAIL NOTIFICATIONS                                   */
-    /* ========================================================= */
+    /* ////////////////= */
 
     // ✅ Notify selected worker
     if (worker?.email) {

@@ -3,16 +3,11 @@ const { Server } = require("socket.io");
 
 let io;
 
-<<<<<<< HEAD
 /**
- * Initialize Socket.IO with shared CORS rules
+ * Initialize Socket.IO
  * @param {http.Server} server - The HTTP server instance
- * @param {object} corsOptions - CORS options from server.js
  */
-function initSocket(server, corsOptions = {}) {
-=======
 function initSocket(server) {
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
   io = new Server(server, {
     cors: {
       origin: [
@@ -23,11 +18,8 @@ function initSocket(server) {
         "https://www.bookyourneed.com",
         "https://worker.bookyourneed.com",
         "https://admin.bookyourneed.com",
-<<<<<<< HEAD
         "https://api.bookyourneed.com",
         "https://app.bookyourneed.com",
-=======
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
       ],
       methods: ["GET", "POST"],
       credentials: true,
@@ -43,7 +35,7 @@ function initSocket(server) {
     /* 🔹 JOB SYSTEM                                      */
     /* ================================================== */
 
-<<<<<<< HEAD
+    // Worker registers (accepts string OR object)
     socket.on("registerWorker", (payload) => {
       const workerId = typeof payload === "object" ? payload.workerId : payload;
       const services = typeof payload === "object" ? payload.services || [] : [];
@@ -54,56 +46,28 @@ function initSocket(server) {
       socket.join(wid); // legacy
       socket.data.workerId = wid;
 
-=======
-    // Worker registers (accepts string OR object)
-    socket.on("registerWorker", (payload) => {
-      const workerId = typeof payload === "object" ? payload.workerId : payload;
-      const services = typeof payload === "object" ? payload.services || [] : [];
-
-      const wid = toStr(workerId);
-      if (!wid) return;
-
-      // Back-compat rooms
-      socket.join(`worker_${wid}`);
-      socket.join(wid); // raw room for legacy emitters
-      socket.data.workerId = wid;
-
-      // Service subscription
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
       services.forEach((s) => {
         const room = `service_${toStr(s).toLowerCase()}`;
         if (room !== "service_") socket.join(room);
       });
-<<<<<<< HEAD
+
       console.log(`🧑‍🔧 Worker registered: ${wid}`);
     });
 
-=======
-
-          });
-
     // Customer registers (accepts string OR object)
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
     socket.on("registerCustomer", (payload) => {
       const customerId = typeof payload === "object" ? payload.customerId : payload;
       const cid = toStr(customerId);
       if (!cid) return;
 
       socket.join(`customer_${cid}`);
-<<<<<<< HEAD
-      socket.join(cid);
-=======
-      socket.join(cid); // raw room for legacy emitters
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
+      socket.join(cid); // legacy
       socket.data.customerId = cid;
 
       console.log(`🙋 Customer registered: ${cid}`);
     });
 
-<<<<<<< HEAD
-=======
-    // Optional explicit job room (for a specific job detail page)
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
+    // Join a specific job room
     socket.on("joinJobRoom", (jobId) => {
       const jid = toStr(jobId);
       if (!jid) return;
@@ -111,10 +75,7 @@ function initSocket(server) {
       console.log(`📦 Joined job room: job_${jid}`);
     });
 
-<<<<<<< HEAD
-=======
-    // Workers can subscribe services later (e.g., after profile fetch)
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
+    // Subscribe to services (for workers)
     socket.on("subscribeService", ({ services = [] } = {}) => {
       services.forEach((s) => {
         const room = `service_${toStr(s).toLowerCase()}`;
@@ -123,10 +84,7 @@ function initSocket(server) {
       console.log(`🧑‍🔧 Subscribed services: ${services.join(", ")}`);
     });
 
-<<<<<<< HEAD
-=======
-    // Job posted → broadcast to matching service room(s)
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
+    // Job posted → broadcast to relevant workers
     socket.on("job:new", ({ job } = {}) => {
       if (!job) return;
       const serviceRoom = `service_${toStr(job.serviceType || "general").toLowerCase()}`;
@@ -134,89 +92,56 @@ function initSocket(server) {
       console.log(`📢 Job broadcast to ${serviceRoom}`);
     });
 
-<<<<<<< HEAD
-=======
-    // Worker submitted a bid → notify that job’s customer
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
+    // Worker submits a bid → notify the job's customer
     socket.on("job:bidSubmitted", ({ jobId, customerId, bid } = {}) => {
       const cid = toStr(customerId);
       if (!jobId || !cid || !bid) return;
       io.to(`customer_${cid}`).emit("job:bidReceived", { jobId, bid });
-<<<<<<< HEAD
-      io.to(cid).emit("job:bidReceived", { jobId, bid });
+      io.to(cid).emit("job:bidReceived", { jobId, bid }); // legacy
       console.log(`💰 Bid submitted for job ${jobId} → customer ${cid}`);
     });
 
-=======
-      io.to(cid).emit("job:bidReceived", { jobId, bid }); // back-compat
-      console.log(`💰 Bid submitted for job ${jobId} → customer ${cid}`);
-    });
-
-    // Customer accepted a bid → notify chosen worker + reflect to customer
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
+    // Customer accepts a bid → notify worker
     socket.on("job:accepted", ({ jobId, workerId, customerId } = {}) => {
       const wid = toStr(workerId);
       const cid = toStr(customerId);
       if (!jobId || !wid || !cid) return;
 
       io.to(`worker_${wid}`).emit("job:assigned", { jobId });
-<<<<<<< HEAD
-      io.to(wid).emit("job:assigned", { jobId });
+      io.to(wid).emit("job:assigned", { jobId }); // legacy
       io.to(`customer_${cid}`).emit("job:update", { jobId, status: "assigned" });
-      io.to(cid).emit("job:update", { jobId, status: "assigned" });
+      io.to(cid).emit("job:update", { jobId, status: "assigned" }); // legacy
       console.log(`✅ Job ${jobId} assigned → worker ${wid}`);
     });
 
-=======
-      io.to(wid).emit("job:assigned", { jobId }); // back-compat
-      io.to(`customer_${cid}`).emit("job:update", { jobId, status: "assigned" });
-      io.to(cid).emit("job:update", { jobId, status: "assigned" }); // back-compat
-      console.log(`✅ Job ${jobId} assigned → worker ${wid}`);
-    });
-
-    // Worker marked job complete → ping customer
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
+    // Worker marks job complete → notify customer
     socket.on("job:workerCompleted", ({ jobId, customerId } = {}) => {
       const cid = toStr(customerId);
       if (!jobId || !cid) return;
       io.to(`customer_${cid}`).emit("job:update", { jobId, status: "worker_completed" });
-<<<<<<< HEAD
       io.to(cid).emit("job:update", { jobId, status: "worker_completed" });
       console.log(`🧰 Worker completed job ${jobId}`);
     });
 
-=======
-      io.to(cid).emit("job:update", { jobId, status: "worker_completed" }); // back-compat
-      console.log(`🧰 Worker completed job ${jobId}`);
-    });
-
-    // Customer confirmed completion → notify worker
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
+    // Customer confirms completion → notify worker
     socket.on("job:customerConfirmed", ({ jobId, workerId } = {}) => {
       const wid = toStr(workerId);
       if (!jobId || !wid) return;
       io.to(`worker_${wid}`).emit("job:update", { jobId, status: "completed" });
-<<<<<<< HEAD
       io.to(wid).emit("job:update", { jobId, status: "completed" });
       console.log(`🎉 Customer confirmed completion for ${jobId}`);
     });
 
-=======
-      io.to(wid).emit("job:update", { jobId, status: "completed" }); // back-compat
-      console.log(`🎉 Customer confirmed completion for ${jobId}`);
-    });
-
-    // Job reopened/cancelled → notify customer (UI can re-prompt)
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
+    // Job reopened → notify customer
     socket.on("job:reopened", ({ jobId, customerId } = {}) => {
       const cid = toStr(customerId);
       if (!jobId || !cid) return;
       io.to(`customer_${cid}`).emit("job:update", { jobId, status: "reopened" });
-<<<<<<< HEAD
       io.to(cid).emit("job:update", { jobId, status: "reopened" });
       console.log(`🚨 Job ${jobId} reopened`);
     });
 
+    // Job cancelled by worker → notify customer
     socket.on("job:cancelledByWorker", ({ jobId, customerId } = {}) => {
       const cid = toStr(customerId);
       if (!jobId || !cid) return;
@@ -225,6 +150,7 @@ function initSocket(server) {
       console.log(`🚫 Job ${jobId} cancelled by worker`);
     });
 
+    // Job cancelled by customer → notify worker
     socket.on("job:cancelledByCustomer", ({ jobId, workerId } = {}) => {
       const wid = toStr(workerId);
       if (!jobId || !wid) return;
@@ -232,33 +158,6 @@ function initSocket(server) {
       io.to(wid).emit("job:update", { jobId, status: "cancelled_by_customer" });
       console.log(`🚫 Job ${jobId} cancelled by customer`);
     });
-=======
-      io.to(cid).emit("job:update", { jobId, status: "reopened" }); // back-compat
-      console.log(`🚨 Job ${jobId} reopened`);
-    });
-    // ==================================================
-// 🚫 Job cancelled by worker or customer
-// ==================================================
-
-// Worker cancels a job → notify customer
-socket.on("job:cancelledByWorker", ({ jobId, customerId } = {}) => {
-  const cid = toStr(customerId);
-  if (!jobId || !cid) return;
-  io.to(`customer_${cid}`).emit("job:update", { jobId, status: "cancelled_by_worker" });
-  io.to(cid).emit("job:update", { jobId, status: "cancelled_by_worker" }); // back-compat
-  console.log(`🚫 Job ${jobId} cancelled by worker`);
-});
-
-// Customer cancels a job → notify worker
-socket.on("job:cancelledByCustomer", ({ jobId, workerId } = {}) => {
-  const wid = toStr(workerId);
-  if (!jobId || !wid) return;
-  io.to(`worker_${wid}`).emit("job:update", { jobId, status: "cancelled_by_customer" });
-  io.to(wid).emit("job:update", { jobId, status: "cancelled_by_customer" }); // back-compat
-  console.log(`🚫 Job ${jobId} cancelled by customer`);
-});
-
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
 
     /* ================================================== */
     /* 🚗 RIDE SYSTEM                                    */
@@ -298,10 +197,7 @@ socket.on("job:cancelledByCustomer", ({ jobId, workerId } = {}) => {
       const { roomId, ...message } = data;
       const rid = toStr(roomId);
       if (!rid) return;
-<<<<<<< HEAD
-=======
       console.log(`📨 New chat message in ${rid}: ${message.message}`);
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
       io.to(rid).emit("receiveMessage", message);
     });
 
@@ -312,30 +208,18 @@ socket.on("job:cancelledByCustomer", ({ jobId, workerId } = {}) => {
     });
 
     /* ================================================== */
-<<<<<<< HEAD
     /* 🆘 SUPPORT CHAT SYSTEM                            */
-=======
-    /* 🆕 SUPPORT / CUSTOMER SERVICE CHAT SYSTEM          */
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
     /* ================================================== */
     socket.on("joinSupportRoom", ({ email } = {}) => {
       const e = toStr(email);
       if (!e) return;
       socket.join(`support_${e}`);
-<<<<<<< HEAD
       console.log(`🧰 Support user joined: ${e}`);
-=======
-      console.log(`🧰 Support: ${e} joined support room.`);
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
     });
 
     socket.on("registerSupportAdmin", (adminId) => {
       socket.join("support_admins");
-<<<<<<< HEAD
       console.log(`🧑‍💼 Support admin joined: ${adminId}`);
-=======
-      console.log(`🧑‍💼 Admin joined support channel: ${adminId}`);
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
     });
 
     socket.on("support:message", (msg = {}) => {
@@ -343,17 +227,9 @@ socket.on("job:cancelledByCustomer", ({ jobId, workerId } = {}) => {
       const e = toStr(email);
       if (!e || !text) return;
 
-<<<<<<< HEAD
       if (sender === "Admin") io.to(`support_${e}`).emit("support:message", msg);
       else io.to("support_admins").emit("support:message", msg);
 
-=======
-      if (sender === "Admin") {
-        io.to(`support_${e}`).emit("support:message", msg); // send to user
-      } else {
-        io.to("support_admins").emit("support:message", msg); // send to admins
-      }
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
       console.log(`📩 Support message from ${sender}: ${text}`);
     });
 
@@ -378,34 +254,20 @@ socket.on("job:cancelledByCustomer", ({ jobId, workerId } = {}) => {
     });
 
     /* ================================================== */
-<<<<<<< HEAD
     /* ❌ Disconnect Event                               */
-=======
-    /* 🔔 Disconnect                                     */
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
     /* ================================================== */
     socket.on("disconnect", () => {
       console.log("❌ Socket disconnected:", socket.id);
     });
   });
 
-<<<<<<< HEAD
-  console.log("✅ Socket.IO initialized successfully with CORS");
+  console.log("✅ Socket.IO initialized successfully");
   return io;
 }
 
 // ==================================================
 // 📤 Export
 // ==================================================
-=======
-  console.log("✅ Socket.IO initialized successfully");
-  return io;
-}
-
-/* ================================================== */
-/* Export io instance                                 */
-/* ================================================== */
->>>>>>> e4ee6847563ff9f15949edfa509b77226308059b
 function getIO() {
   if (!io) throw new Error("Socket.io not initialized!");
   return io;
