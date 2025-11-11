@@ -1,3 +1,4 @@
+require("dotenv").config(); // ✅ load environment variables first
 const express = require("express");
 const router = express.Router();
 const Job = require("../models/Job");
@@ -9,9 +10,6 @@ const { sendEmailSafe } = require("../emailService");
 const { getIO } = require("../socket"); // ✅ Added for real-time
 
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
-
-
-
 // 🌍 Distance helper
 const haversine = (lat1, lon1, lat2, lon2) => {
   const R = 6371;
@@ -602,36 +600,39 @@ router.post("/cancel-job/:jobId", async (req, res) => {
         .json({ message: "Job cannot be cancelled in current state." });
     }
 
-    // ✅ Process Stripe refund safely
-    if (job.stripePaymentIntentId) {
-      try {
-        const paymentIntent = await stripe.paymentIntents.retrieve(job.stripePaymentIntentId);
-        const charge = paymentIntent.latest_charge
-          ? await stripe.charges.retrieve(paymentIntent.latest_charge)
-          : null;
+// ✅ Process Stripe refund safely (with 4.99 deduction logic)
+if (job.stripePaymentIntentId) {
+  try {
+    const paymentIntent = await stripe.paymentIntents.retrieve(job.stripePaymentIntentId);
+    const charge = paymentIntent.latest_charge
+      ? await stripe.charges.retrieve(paymentIntent.latest_charge)
+      : null;
 
-        const paidAmount = charge ? charge.amount / 100 : 0;
-        const safeRefundAmount = Math.min(Number(refundAmount), paidAmount);
+    const paidAmount = charge ? charge.amount / 100 : 0; // in CAD dollars
 
-        if (safeRefundAmount > 0) {
-          await stripe.refunds.create({
-            payment_intent: job.stripePaymentIntentId,
-            amount: Math.round(safeRefundAmount * 100),
-          });
-          console.log(`✅ Stripe refund processed: $${safeRefundAmount}`);
-        } else {
-          console.warn("⚠️ No refundable amount available:", job._id);
-        }
-      } catch (stripeError) {
-        console.error("❌ Stripe refund failed:", stripeError);
-        return res.status(500).json({
-          message: "Stripe refund failed",
-          details: stripeError.message,
-        });
-      }
+    // Ensure we have a valid refund amount (never more than paid)
+    const refundToIssue = Math.min(refundAmount, paidAmount);
+
+    if (refundToIssue > 0) {
+      await stripe.refunds.create({
+        payment_intent: job.stripePaymentIntentId,
+        amount: Math.round(refundToIssue * 100), // in cents
+        reason: "requested_by_customer",
+      });
+      console.log(`💸 Stripe refund processed: $${refundToIssue.toFixed(2)}`);
     } else {
-      console.warn("⚠️ No stripePaymentIntentId for this job");
+      console.warn(`⚠️ No refundable amount available for job ${job._id}`);
     }
+  } catch (err) {
+    console.error("❌ Stripe refund failed:", err);
+    return res.status(500).json({
+      message: "Stripe refund failed",
+      details: err.message,
+    });
+  }
+} else {
+  console.warn("⚠️ No stripePaymentIntentId for this job");
+}
 
     // ✅ Update DB (use findByIdAndUpdate since we used lean)
     const updatedJob = await Job.findByIdAndUpdate(
