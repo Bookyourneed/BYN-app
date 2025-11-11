@@ -123,7 +123,7 @@ const WorkerSchema = new mongoose.Schema(
     // 📧 Email tracking (per job)
     jobEmailHistory: {
       type: Map,
-      of: Date, // jobId: timestamp
+      of: Date,
       default: {},
     },
 
@@ -143,7 +143,7 @@ const WorkerSchema = new mongoose.Schema(
     ],
 
     // 💸 Stripe + Payout Settings
-    stripeAccountId: { type: String, default: null }, // For instant payouts
+    stripeAccountId: { type: String, default: null },
     payoutPreferences: {
       defaultMethod: {
         type: String,
@@ -159,6 +159,10 @@ const WorkerSchema = new mongoose.Schema(
       },
     },
 
+    // 🧾 Job Tracking
+    jobsCompleted: { type: Number, default: 0 },
+    totalEarnings: { type: Number, default: 0 },
+
     // 🚫 Cancellation & Suspension Tracking
     cancellationCount: { type: Number, default: 0 },
     suspendedUntil: { type: Date, default: null },
@@ -168,10 +172,7 @@ const WorkerSchema = new mongoose.Schema(
         at: { type: Date, default: Date.now },
       },
     ],
-    requiresAdminReview: {
-      type: Boolean,
-      default: false, // true if escalated after 4+ cancels
-    },
+    requiresAdminReview: { type: Boolean, default: false },
     lastCancellationAt: Date,
   },
   { timestamps: true }

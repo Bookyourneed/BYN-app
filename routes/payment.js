@@ -535,7 +535,7 @@ async function refundExpiredJobs() {
 
 // ============================================================
 // ✅ CUSTOMER CONFIRMS JOB COMPLETION
-// Handles bid changes, disputes, and smart payment reconciliation
+// Smart commission system + job tracking
 // ============================================================
 router.post("/jobs/:jobId/confirm", async (req, res) => {
   const { jobId } = req.params;
@@ -543,18 +543,14 @@ router.post("/jobs/:jobId/confirm", async (req, res) => {
 
   try {
     const job = await Job.findById(jobId)
-      .populate("assignedTo", "email name walletBalance commissionRate")
+      .populate("assignedTo", "email name walletBalance commissionRate jobsCompleted totalEarnings")
       .populate("customerId", "email name stripeCustomerId");
 
     if (!job) return res.status(404).json({ error: "Job not found" });
-
-    // ⚡ Safety checks
-    if (job.status === "dispute") {
-      return res.status(400).json({ error: "Job is under dispute. Cannot release funds." });
-    }
-    if (!job.stripePaymentIntentId) {
+    if (job.status === "dispute")
+      return res.status(400).json({ error: "Job is under dispute" });
+    if (!job.stripePaymentIntentId)
       return res.status(400).json({ error: "No payment intent found" });
-    }
 
     // ✅ Retrieve existing payment
     const paymentIntent = await stripe.paymentIntents.retrieve(job.stripePaymentIntentId);
@@ -567,110 +563,103 @@ router.post("/jobs/:jobId/confirm", async (req, res) => {
     const difference = parseFloat((currentPrice - amountPaid).toFixed(2));
 
     // ============================================================
-    // 💰 ADJUST PAYMENT IF BID CHANGED (only at completion)
+    // 💰 Adjust Payment if Bid Changed
     // ============================================================
     if (Math.abs(difference) >= 0.5) {
       if (difference > 0) {
-        // Price increased → charge the difference
         console.log(`💳 Charging +$${difference} for updated bid (Job ${job._id})`);
 
-        // 🔹 Reuse customer's original payment method
         const previousIntent = await stripe.paymentIntents.retrieve(job.stripePaymentIntentId);
         const defaultPaymentMethod = previousIntent.payment_method;
+        if (!defaultPaymentMethod) throw new Error("Customer has no saved payment method.");
 
-        if (!defaultPaymentMethod) {
-          throw new Error("Customer has no saved payment method from the original payment.");
-        }
-
-        // 🔹 Create and confirm extra charge using saved card
         const extraCharge = await stripe.paymentIntents.create({
           amount: Math.round(difference * 100),
           currency: "cad",
           customer: job.customerId.stripeCustomerId,
           payment_method: defaultPaymentMethod,
-          off_session: true, // ✅ charge automatically
-          confirm: true, // ✅ instant confirmation
-          description: `Additional charge for bid update on ${job.jobTitle}`,
-          automatic_payment_methods: {
-            enabled: true,
-            allow_redirects: "never", // ✅ prevents redirect error
-          },
+          off_session: true,
+          confirm: true,
+          description: `Bid update for ${job.jobTitle}`,
+          automatic_payment_methods: { enabled: true, allow_redirects: "never" },
         });
 
-        console.log(`✅ Charged +$${difference} successfully (PaymentIntent: ${extraCharge.id})`);
+        console.log(`✅ Charged +$${difference} (PaymentIntent: ${extraCharge.id})`);
       } else {
-        // Price decreased → refund the difference
         const refundAmount = Math.abs(difference);
         console.log(`💸 Refunding $${refundAmount} for reduced bid (Job ${job._id})`);
         await stripe.refunds.create({
           payment_intent: job.stripePaymentIntentId,
           amount: Math.round(refundAmount * 100),
         });
-        console.log(`✅ Refunded $${refundAmount} successfully`);
+        console.log(`✅ Refunded $${refundAmount}`);
       }
     }
 
     // ============================================================
-    // 🧾 FINALIZE JOB + RELEASE FUNDS
+    // 🧾 Finalize Job + Smart Payout
     // ============================================================
     job.status = "completed";
     job.paymentStatus = "released";
-    job.paymentAdjustmentPending = false;
-
     job.completion = job.completion || {};
     job.completion.customerConfirmedAt = new Date();
-    job.completion.releaseDate = new Date();
+    job.paymentInfo = { escrowStatus: "released", releasedAt: new Date() };
 
-    job.paymentInfo = job.paymentInfo || {};
-    job.paymentInfo.escrowStatus = "released";
-    job.paymentInfo.releasedAt = new Date();
-
-    // 💼 Worker payout after commission
     const worker = await Worker.findById(job.assignedTo);
     if (worker) {
-      const commission = worker.commissionRate || 0.15;
-      const earning = parseFloat((currentPrice * (1 - commission)).toFixed(2));
+      // 🔹 Commission logic based on total earnings
+      const previousEarnings = worker.totalEarnings || 0;
+      let commission = 0.0445; // 4.45% base rate
 
-      worker.walletBalance = (worker.walletBalance || 0) + earning;
+      if (previousEarnings >= 100 && previousEarnings < 300) commission = 0.05;
+      if (previousEarnings >= 300) commission = 20 / currentPrice; // flat $20 cap for large earners
+
+      const payout = commission >= 1
+        ? currentPrice - 20
+        : parseFloat((currentPrice * (1 - commission)).toFixed(2));
+
+      worker.walletBalance = (worker.walletBalance || 0) + payout;
       worker.walletHistory.push({
         type: "credit",
-        amount: earning,
+        amount: payout,
         jobId: job._id,
         date: new Date(),
         released: true,
-        notes: "Automatic payout after customer confirmation.",
+        notes: `Automatic payout after customer confirmation. Base: $${currentPrice}, Commission: ${commission >= 1 ? "$20 flat" : (commission * 100).toFixed(2) + "%"}.`,
       });
-      await worker.save();
 
-      console.log(`💸 Released $${earning} to worker ${worker._id}`);
+      // 🔹 Update stats
+      worker.jobsCompleted = (worker.jobsCompleted || 0) + 1;
+      worker.totalEarnings = (worker.totalEarnings || 0) + payout;
+
+      await worker.save();
+      console.log(`💸 Released $${payout} to ${worker.name} (Total Jobs: ${worker.jobsCompleted}, Total Earned: $${worker.totalEarnings.toFixed(2)})`);
     }
 
-    // Log completion
     job.history.push({
       action: "customer_confirmed",
       by: "customer",
       at: new Date(),
-      notes: `Customer confirmed completion. Final amount: $${currentPrice}`,
+      notes: `Customer confirmed completion. Final: $${currentPrice}`,
     });
     await job.save();
 
     // ============================================================
-    // 🔔 SOCKET.IO UPDATES
+    // 🔔 Socket Updates
     // ============================================================
     io.to(`worker_${worker._id}`).emit("job:update", {
       jobId: job._id,
       status: "completed",
-      message: "✅ Customer confirmed completion; payout released.",
+      message: `✅ Customer confirmed job. $${currentPrice} released.`,
     });
-
     io.to(`customer_${job.customerId.email}`).emit("job:update", {
       jobId: job._id,
       status: "completed",
-      message: "🎉 Job marked complete and payout released.",
+      message: "🎉 Job confirmed and payout released.",
     });
 
     // ============================================================
-    // ✉️ EMAIL NOTIFICATION
+    // ✉️ Email Notifications
     // ============================================================
     if (job.assignedTo?.email) {
       await sendEmailSafe({
@@ -678,18 +667,24 @@ router.post("/jobs/:jobId/confirm", async (req, res) => {
         subject: "✅ Job Completed – Payment Released",
         html: `
           <h2>Hi ${job.assignedTo.name || "Worker"},</h2>
-          <p>Your job <strong>${job.jobTitle}</strong> has been marked completed by the customer.</p>
-          <p>The final price was <strong>$${currentPrice}</strong>.</p>
-          <p>Payment has been released to your wallet.</p>
-          <br><p>— Book Your Need</p>
+          <p>Your job <strong>${job.jobTitle}</strong> has been confirmed by the customer.</p>
+          <p>Final price: <strong>$${currentPrice}</strong></p>
+          <p>You received <strong>$${(worker.walletHistory.at(-1)?.amount).toFixed(2)}</strong> after commission.</p>
+          <p>Commission tier: ${
+            worker.totalEarnings < 100
+              ? "4.45%"
+              : worker.totalEarnings < 300
+              ? "5%"
+              : "$20 flat"
+          }</p>
+          <br><p>— Book Your Need Team</p>
         `,
       });
     }
 
-    // ✅ Done
     return res.json({
       success: true,
-      message: "Job confirmed, payment reconciled, and payout released.",
+      message: "Job confirmed and payout released.",
     });
   } catch (err) {
     console.error("❌ Confirm job error:", err);
@@ -699,7 +694,6 @@ router.post("/jobs/:jobId/confirm", async (req, res) => {
     });
   }
 });
-
 
 
 // ✅ Customer files a dispute (funds frozen in escrow)

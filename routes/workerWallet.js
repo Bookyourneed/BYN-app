@@ -5,24 +5,34 @@ const Worker = require("../models/Worker");
 const { sendEmailSafe } = require("../emailService");
 
 // =====================================================
-// ✅ GET Worker Wallet Balance + History
+// ✅ GET Worker Wallet Balance + History + Stats
 // =====================================================
 router.get("/wallet/:workerId", async (req, res) => {
   try {
     const { workerId } = req.params;
+
     const worker = await Worker.findById(workerId).select(
-      "walletBalance walletHistory name email"
+      "walletBalance walletHistory name email jobsCompleted totalEarnings"
     );
 
     if (!worker) {
       return res.status(404).json({ error: "Worker not found" });
     }
 
+    // 🧮 Add console check to verify data is being returned
+    console.log("📊 Worker Stats:", {
+      name: worker.name,
+      jobsCompleted: worker.jobsCompleted,
+      totalEarnings: worker.totalEarnings,
+    });
+
     res.json({
       walletBalance: worker.walletBalance || 0,
       walletHistory: worker.walletHistory || [],
       workerName: worker.name,
       workerEmail: worker.email,
+      jobsCompleted: worker.jobsCompleted || 0,
+      totalEarnings: worker.totalEarnings || 0,
     });
   } catch (err) {
     console.error("❌ Wallet fetch error:", err);
