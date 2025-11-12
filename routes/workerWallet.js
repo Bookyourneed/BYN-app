@@ -11,7 +11,6 @@ router.get("/wallet/:workerId", async (req, res) => {
   try {
     const { workerId } = req.params;
 
-    // 🧩 Fetch worker with job titles populated
     const worker = await Worker.findById(workerId)
       .populate({
         path: "walletHistory.jobId",
@@ -26,7 +25,6 @@ router.get("/wallet/:workerId", async (req, res) => {
       return res.status(404).json({ error: "Worker not found" });
     }
 
-    // 🧠 Safe fallbacks in case fields are missing
     const jobsCompleted =
       typeof worker.jobsCompleted === "number"
         ? worker.jobsCompleted
@@ -39,9 +37,6 @@ router.get("/wallet/:workerId", async (req, res) => {
             .filter((h) => h.type === "credit")
             .reduce((sum, h) => sum + (h.amount || 0), 0);
 
-    console.log("✅ Wallet Stats:", { jobsCompleted, totalEarnings });
-
-    // 🎯 Final clean response
     res.json({
       walletBalance: worker.walletBalance || 0,
       walletHistory: worker.walletHistory || [],

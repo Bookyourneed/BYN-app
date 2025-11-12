@@ -863,24 +863,6 @@ router.get("/notifications/:workerId", async (req, res) => {
   }
 });
 
-// ✅ GET Wallet Info for a Worker
-router.get("/wallet/:workerId", async (req, res) => {
-  try {
-    const worker = await Worker.findById(req.params.workerId)
-      .populate("walletHistory.jobId", "jobTitle");
-
-    if (!worker) return res.status(404).json({ error: "Worker not found" });
-
-    res.json({
-      walletBalance: worker.walletBalance || 0,
-      walletHistory: worker.walletHistory || [],
-    });
-  } catch (err) {
-    console.error("❌ Wallet fetch error:", err);
-    res.status(500).json({ error: "Failed to load wallet data" });
-  }
-});
-
 router.post("/complete-job", async (req, res) => {
   const { jobId, workerId } = req.body;
 

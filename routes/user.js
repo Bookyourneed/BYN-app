@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 const express = require("express");
 const router = express.Router();
@@ -110,7 +111,7 @@ router.post("/signup", async (req, res) => {
 router.post("/login", async (req, res) => {
   const { email, password } = req.body;
   try {
-    const user = await User.findOne({ email });
+    const user = await User.findOne({ email: email });
     if (!user)
       return res.status(404).json({ message: "User not found." });
 
@@ -132,7 +133,7 @@ router.post("/google-login", async (req, res) => {
   const { name, email, googleId } = req.body;
 
   try {
-    let user = await User.findOne({ email });
+    let user = await User.findOne({ email: email });
     const isNewUser = !user;
 
     if (isNewUser) {
@@ -274,7 +275,6 @@ router.post("/save-phone", async (req, res) => {
   }
 });
 
-// ✅ Update full profile
 router.post("/update-profile", async (req, res) => {
   const {
     email,
@@ -297,8 +297,9 @@ router.post("/update-profile", async (req, res) => {
   if (!email) return res.status(400).json({ error: "Email is required." });
 
   try {
-    const user = await User.findOne({ email });
-    if (!user) return res.status(404).json({ error: "User not found." });
+    // ✅ fixed line
+    const user = await User.findOne({ email: email });
+    if (!user) return res.status(404).json({ error: "User not found" });
 
     if (name !== undefined) user.name = name;
     if (lastName !== undefined) user.lastName = lastName;
@@ -415,28 +416,38 @@ router.post("/verify-reset-otp", async (req, res) => {
   }
 });
 
-// ✅ Get Profile
+// ✅ Get Profile by Email
 router.get("/user-profile/:email", async (req, res) => {
   try {
-    const user = await User.findOne({ email: req.params.email });
-    if (!user) return res.status(404).json({ message: "User not found" });
+    const { email } = req.params;
+
+    console.log("📩 Fetching profile for:", email);
+
+    const user = await User.findOne({ email: email });
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
 
     res.status(200).json(user);
   } catch (err) {
-    console.error("Profile fetch error:", err);
+    console.error("❌ Profile fetch error:", err);
     res.status(500).json({ message: "Server error" });
   }
 });
 
-// ✅ Get Profile by ID
 router.get("/profile/:id", async (req, res) => {
+  const { id } = req.params;
+  if (!id || id === "null" || id === "undefined") {
+    return res.status(400).json({ message: "Invalid user ID" });
+  }
+
   try {
-    const user = await User.findById(req.params.id);
+    const user = await User.findById(id);
     if (!user) return res.status(404).json({ message: "User not found" });
     res.status(200).json(user);
   } catch (err) {
-    console.error("Profile fetch error:", err);
-    res.status(500).json({ message: "Server error" });
+    console.error("❌ Profile fetch error:", err);
+    res.status(500).json({ message: "Server error fetching user profile" });
   }
 });
 
