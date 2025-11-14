@@ -91,6 +91,97 @@ router.post("/post", async (req, res) => {
   }
 });
 
+// =========================================================
+// ✅ GET: All Ride Requests + Chats for a Worker (Requests Hub)
+// =========================================================
+router.get("/worker/:workerId/requests", async (req, res) => {
+  try {
+    const { workerId } = req.params;
+
+    // 1️⃣ Fetch all rides created by this worker
+    const rides = await Ride.find({ workerId })
+      .select("_id from to date time")
+      .lean();
+
+    if (!rides.length) {
+      return res.json({ rides: [], hub: [] });
+    }
+
+    const hub = [];
+
+    // 2️⃣ For each ride, fetch requests + chats
+    for (const ride of rides) {
+      const rideId = ride._id.toString();
+
+      // Fetch latest booking request
+      const request = await BookingRequest.findOne({
+        rideId,
+        status: { $in: ["pending", "active", "accepted"] }
+      })
+        .populate("customerId", "name profilePhotoUrl email")
+        .sort({ createdAt: -1 })
+        .lean();
+
+      // Fetch latest chat message
+      const chat = await RideChat.findOne({ rideId })
+        .populate("messages.sender", "name profilePhotoUrl email")
+        .lean();
+
+      let latestChat = null;
+      if (chat && chat.messages?.length) {
+        const sorted = chat.messages.sort(
+          (a, b) => new Date(b.timestamp) - new Date(a.timestamp)
+        );
+        latestChat = sorted[0];
+      }
+
+      // Decide what to show
+      const best = (() => {
+        if (latestChat && request) {
+          return new Date(latestChat.timestamp) > new Date(request.createdAt)
+            ? { type: "chat", data: latestChat }
+            : { type: "request", data: request };
+        }
+        if (latestChat) return { type: "chat", data: latestChat };
+        if (request) return { type: "request", data: request };
+        return null;
+      })();
+
+      if (best) {
+        hub.push({
+          rideId,
+          from: ride.from,
+          to: ride.to,
+          date: ride.date,
+          time: ride.time,
+
+          type: best.type,
+          lastMessage: best.type === "chat" ? best.data.text : best.data.message,
+          timestamp:
+            best.type === "chat"
+              ? best.data.timestamp
+              : best.data.createdAt,
+
+          customer:
+            best.type === "chat"
+              ? best.data.sender
+              : best.data.customerId
+        });
+      }
+    }
+
+    // 3️⃣ Sort final list by latest interaction
+    hub.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+    res.json({ rides, hub });
+  } catch (err) {
+    console.error("❌ Error in requests-hub:", err);
+    res.status(500).json({ error: "Failed to load requests hub" });
+  }
+});
+
+
+
 // ✅ SMART RIDE SEARCH – includes worker profilePhotoUrl
 router.post("/search", async (req, res) => {
   try {
