@@ -602,7 +602,7 @@ console.log("✅ Found booking:", {
 });
 
 // =====================================================
-// ✅ Customer Completes Ride → Credit driver wallet
+// ✅ Customer Completes Ride → Stripe payout + Wallet credit + Earnings update
 // =====================================================
 router.post("/customer-complete", async (req, res) => {
   const { rideId } = req.body;
@@ -630,37 +630,75 @@ router.post("/customer-complete", async (req, res) => {
     const driver = await Worker.findById(ride.workerId);
     if (!driver) return res.status(400).json({ error: "No driver assigned" });
 
-    // 💵 Calculate payout
+    // 💵 Calculate payout (subtract Stripe + BYN fee)
     const baseFare = Number(ride.price);
-    const platformFee = 2; // BYN keeps $2 per ride
-    const driverEarning = Math.max(0, baseFare - platformFee);
+    const stripeFee = 0.36; // Stripe transaction fee
+    const platformFee = 2.0; // BYN platform fee per ride
+    const finalPayout = Math.max(0, baseFare - stripeFee - platformFee);
 
-    console.log("💰 [CUSTOMER-COMPLETE] Base:", baseFare, "→ Driver earns:", driverEarning);
+    console.log(
+      `💰 [CUSTOMER-COMPLETE] Base: ${baseFare}, Fees: ${stripeFee + platformFee}, Driver earns: ${finalPayout}`
+    );
 
-    // 💼 Credit driver's wallet
-    driver.walletBalance = (driver.walletBalance || 0) + driverEarning;
+    // 💳 Create Stripe Transfer (if driver connected)
+    try {
+      if (!driver.stripeAccountId) {
+        console.warn("⚠️ Driver not connected to Stripe, skipping auto-transfer.");
+      } else {
+        const transfer = await stripe.transfers.create({
+          amount: Math.round(finalPayout * 100),
+          currency: "cad",
+          destination: driver.stripeAccountId,
+          description: `BYN Ride payout to ${driver.name}`,
+        });
+        console.log(`✅ Stripe payout completed: ${transfer.id}`);
+
+        // Update ride payout status
+        ride.stripePaymentIntentId = booking.paymentIntentId;
+        ride.paymentStatus = "paid";
+        ride.payoutStatus = "completed";
+        ride.payoutAmount = finalPayout;
+        ride.payoutDate = new Date();
+        ride.isPaidOut = true;
+        await ride.save();
+      }
+    } catch (err) {
+      console.error("❌ Stripe payout failed:", err.message);
+    }
+
+    // 💼 Credit driver's wallet + total earnings
+    driver.walletBalance = (driver.walletBalance || 0) + finalPayout;
+    driver.totalEarnings = (driver.totalEarnings || 0) + finalPayout;
+
     driver.walletHistory.push({
       type: "credit",
-      amount: driverEarning,
+      amount: finalPayout,
       rideId: ride._id,
       date: new Date(),
-      notes: "Ride completed payout",
+      released: true,
+      notes: `Ride payout (after $${(stripeFee + platformFee).toFixed(2)} fees)`,
     });
+
     await driver.save();
 
-    // ✅ Mark both booking & ride completed
+    // ✅ Mark booking & ride complete
     booking.status = "completed";
+    booking.escrowStatus = "released";
+    booking.rideStatus = "completed";
     await booking.save();
+
     ride.status = "completed";
     await ride.save();
 
-    console.log("📦 [CUSTOMER-COMPLETE] Booking + Ride updated to completed.");
+    console.log(
+      "📦 [CUSTOMER-COMPLETE] Booking + Ride updated to completed + wallet credited + total earnings updated."
+    );
 
-    // 🔔 Socket notifications
+    // 🔔 Real-time socket notifications
     io.to(`worker_${driver._id}`).emit("ride:update", {
       rideId: ride._id,
       status: "completed",
-      message: `🎉 Ride completed. You earned $${driverEarning}.`,
+      message: `🎉 Ride completed. $${finalPayout} released to your wallet.`,
     });
 
     io.to(`customer_${customer._id}`).emit("ride:update", {
@@ -669,33 +707,36 @@ router.post("/customer-complete", async (req, res) => {
       message: "✅ Ride marked complete and driver paid.",
     });
 
-    // ✉️ Send emails
+    // ✉️ Notify driver via email
     await sendEmailSafe({
       to: driver.email,
       subject: "💰 Ride Payment Released",
       html: `
         <h2>Hi ${driver.name},</h2>
         <p>Your ride <b>${ride.from} → ${ride.to}</b> has been completed.</p>
-        <p>You earned <b>$${driverEarning}</b> (after $2 BYN fee).</p>
-        <br><p>— Book Your Need</p>
+        <p>You earned <b>$${finalPayout.toFixed(2)}</b> (after fees).</p>
+        <p>Funds have been added to your BYN wallet and sent to your Stripe account if connected.</p>
+        <br><p>— Book Your Need Team</p>
       `,
     });
 
+    // ✉️ Notify customer
     await sendEmailSafe({
       to: customer.email,
       subject: "✅ Ride Completed",
       html: `
         <h2>Hi ${customer.name || "Customer"},</h2>
         <p>Your ride <b>${ride.from} → ${ride.to}</b> has been completed successfully.</p>
-        <p>Thanks for using Book Your Need 🚗</p>
+        <p>Thanks for using <b>Book Your Need</b> 🚗</p>
       `,
     });
 
     console.log("📧 [CUSTOMER-COMPLETE] Emails sent to both driver and customer.");
 
+    // ✅ Final Response
     res.json({
       success: true,
-      message: `Ride completed. Driver earned $${driverEarning}.`,
+      message: `Ride completed. Driver earned $${finalPayout}.`,
     });
   } catch (err) {
     console.error("❌ [CUSTOMER-COMPLETE] Error:", err);
@@ -703,7 +744,7 @@ router.post("/customer-complete", async (req, res) => {
   }
 });
 
-// =====================================================
+
 // ⚠️ Step 4: Dispute Ride → Hold Payment
 // =====================================================
 router.post("/dispute", async (req, res) => {
@@ -733,140 +774,147 @@ router.post("/dispute", async (req, res) => {
 });
 
 // =====================================================
-// 🕒 Step 5: Auto-Complete after 48h → Release Payment + Emails + Wallet Update
+// ✅ AUTO-COMPLETE RIDES (after timeout) → Auto-payout + wallet credit
 // =====================================================
 router.post("/auto-complete", async (req, res) => {
   try {
+    const { rideId } = req.body;
     const io = req.app.get("socketio");
-    const { sendRideEmail } = require("../emailService");
-    const now = new Date();
 
-    // 1️⃣ Find all rides where driver completed 48h ago, customer didn’t confirm
-    const bookings = await BookingRequest.find({
-      rideStatus: "worker_completed",
-      escrowStatus: { $in: ["pending_release", "on_hold", "captured"] },
-      releaseDate: { $lte: now },
-    })
-      .populate({
-        path: "rideId",
-        populate: { path: "workerId", select: "name email walletBalance walletHistory" },
-      })
-      .populate("customerId", "name email")
-      .lean();
+    console.log("🕒 [AUTO-COMPLETE] Running for ride:", rideId);
 
-    if (!bookings.length)
-      return res.json({ success: true, message: "No bookings ready for auto-release" });
+    // Fetch booking and populate required fields
+    const booking = await BookingRequest.findOne({ rideId })
+      .populate("rideId")
+      .populate("customerId");
 
-    let releasedCount = 0;
-    const failed = [];
-
-    for (const booking of bookings) {
-      try {
-        const ride = booking.rideId;
-        const driver = ride?.workerId;
-        if (!ride || !driver) continue;
-
-        // 2️⃣ Capture payment if not already captured
-        try {
-          const intent = await stripe.paymentIntents.retrieve(booking.paymentIntentId);
-          if (intent.status === "requires_capture") {
-            await stripe.paymentIntents.capture(booking.paymentIntentId);
-            console.log(`💳 Auto-captured payment for booking ${booking._id}`);
-          } else {
-            console.log(`ℹ️ Payment already captured for booking ${booking._id}`);
-          }
-        } catch (err) {
-          console.warn(`⚠️ Stripe capture skipped for ${booking._id}: ${err.message}`);
-        }
-
-        // 3️⃣ Credit driver's wallet (base fare minus $2 fee)
-        const baseFare = Number(ride.price);
-        const platformFee = 2;
-        const earning = Math.max(0, baseFare - platformFee);
-
-        const driverDoc = await require("../models/Worker").findById(driver._id);
-        driverDoc.walletBalance = (driverDoc.walletBalance || 0) + earning;
-        driverDoc.walletHistory.push({
-          type: "credit",
-          amount: earning,
-          rideId: ride._id,
-          date: new Date(),
-          notes: "Auto-completed after 48h (system payout)",
-        });
-        await driverDoc.save();
-
-        // 4️⃣ Update booking + ride statuses
-        await BookingRequest.findByIdAndUpdate(booking._id, {
-          rideStatus: "completed",
-          escrowStatus: "released",
-          status: "completed",
-          customerConfirmedAt: new Date(),
-        });
-
-        await require("../models/Ride").findByIdAndUpdate(ride._id, {
-          status: "completed",
-          updatedAt: new Date(),
-        });
-
-        // 5️⃣ Notify both parties in real-time
-        const payload = {
-          rideId: ride._id,
-          bookingId: booking._id,
-          customerId: booking.customerId._id,
-          driverId: driver._id,
-          from: ride.from,
-          to: ride.to,
-          date: ride.date,
-          time: ride.time,
-          status: "completed",
-          message: `✅ Ride auto-completed after 48 hours. $${earning} released to driver.`,
-        };
-
-        io.to(`ride_customer_${booking.customerId._id}`).emit("ride-auto-complete", payload);
-        io.to(`ride_driver_${driver._id}`).emit("ride-auto-complete:driver", payload);
-        io.to(`ride_${ride._id}`).emit("ride-update", payload);
-
-        // 6️⃣ Email notifications
-        if (booking.customerId?.email) {
-          await sendRideEmail("rideConfirmed", {
-            to: booking.customerId.email,
-            customerName: booking.customerId.name,
-            driverName: driver.name,
-            from: ride.from,
-            toLocation: ride.to,
-            date: ride.date,
-            time: ride.time,
-          });
-        }
-
-        if (driver?.email) {
-          await sendRideEmail("rideConfirmed", {
-            to: driver.email,
-            customerName: booking.customerId.name,
-            driverName: driver.name,
-            from: ride.from,
-            toLocation: ride.to,
-            date: ride.date,
-            time: ride.time,
-          });
-        }
-
-        releasedCount++;
-        console.log(`💰 Auto-released booking ${booking._id} → Driver ${driver.email} got $${earning}`);
-      } catch (err) {
-        console.error(`❌ Failed to auto-release ${booking._id}:`, err.message);
-        failed.push({ bookingId: booking._id, error: err.message });
-      }
+    if (!booking) {
+      console.warn("⚠️ [AUTO-COMPLETE] No booking found for ride:", rideId);
+      return res.status(404).json({ error: "Booking not found" });
     }
+
+    const ride = booking.rideId;
+    const customer = booking.customerId;
+    const driver = await Worker.findById(ride.workerId);
+
+    if (!driver) {
+      console.error("❌ [AUTO-COMPLETE] No driver found for ride:", rideId);
+      return res.status(400).json({ error: "Driver not found" });
+    }
+
+    // 💵 Calculate payout (same as manual)
+    const baseFare = Number(ride.price);
+    const stripeFee = 0.36;
+    const platformFee = 2;
+    const finalPayout = Math.max(0, baseFare - stripeFee - platformFee);
+
+    console.log(
+      `💰 [AUTO-COMPLETE] Auto-paying driver $${finalPayout.toFixed(
+        2
+      )} (Base $${baseFare} - Fees $${(stripeFee + platformFee).toFixed(2)})`
+    );
+
+    // 💳 Try Stripe transfer if driver connected
+    try {
+      if (driver.stripeAccountId) {
+        const transfer = await stripe.transfers.create({
+          amount: Math.round(finalPayout * 100),
+          currency: "cad",
+          destination: driver.stripeAccountId,
+          description: `BYN Auto-Payout to ${driver.name}`,
+        });
+
+        console.log(`✅ [AUTO-COMPLETE] Stripe payout sent: ${transfer.id}`);
+
+        ride.stripePaymentIntentId = booking.paymentIntentId;
+        ride.paymentStatus = "paid";
+        ride.payoutStatus = "completed";
+        ride.payoutAmount = finalPayout;
+        ride.payoutDate = new Date();
+        ride.isPaidOut = true;
+        await ride.save();
+      } else {
+        console.warn(
+          "⚠️ [AUTO-COMPLETE] Driver not connected to Stripe — wallet credit only."
+        );
+      }
+    } catch (err) {
+      console.error("❌ [AUTO-COMPLETE] Stripe payout failed:", err.message);
+    }
+
+    // 💼 Credit wallet regardless (acts as internal ledger)
+    driver.walletBalance = (driver.walletBalance || 0) + finalPayout;
+    driver.walletHistory.push({
+      type: "credit",
+      amount: finalPayout,
+      rideId: ride._id,
+      date: new Date(),
+      released: true,
+      notes: `Auto ride payout (after $${(stripeFee + platformFee).toFixed(
+        2
+      )} fees)`,
+    });
+    await driver.save();
+
+    // ✅ Update booking and ride
+    booking.status = "completed";
+    booking.escrowStatus = "released";
+    booking.rideStatus = "completed";
+    await booking.save();
+
+    ride.status = "completed";
+    await ride.save();
+
+    console.log("📦 [AUTO-COMPLETE] Ride and booking marked as completed.");
+
+    // 🔔 Notify both via socket
+    io.to(`worker_${driver._id}`).emit("ride:update", {
+      rideId: ride._id,
+      status: "completed",
+      message: `✅ Ride auto-completed. $${finalPayout} released to your wallet.`,
+    });
+
+    io.to(`customer_${customer._id}`).emit("ride:update", {
+      rideId: ride._id,
+      status: "completed",
+      message: "✅ Ride auto-completed and driver paid.",
+    });
+
+    // ✉️ Emails
+    await sendEmailSafe({
+      to: driver.email,
+      subject: "💸 Ride Auto-Completed & Payment Released",
+      html: `
+        <h2>Hi ${driver.name},</h2>
+        <p>Your ride <b>${ride.from} → ${ride.to}</b> was automatically marked as completed.</p>
+        <p>You earned <b>$${finalPayout.toFixed(
+          2
+        )}</b> (after fees), credited to your wallet and sent to your Stripe account if connected.</p>
+        <p>Transfer Type: Auto-Complete</p>
+        <br><p>— Book Your Need</p>
+      `,
+    });
+
+    await sendEmailSafe({
+      to: customer.email,
+      subject: "✅ Ride Auto-Completed",
+      html: `
+        <h2>Hi ${customer.name || "Customer"},</h2>
+        <p>Your ride <b>${ride.from} → ${ride.to}</b> has been automatically completed and payment released to the driver.</p>
+        <p>If this was in error, please contact support immediately.</p>
+        <br><p>— Book Your Need</p>
+      `,
+    });
+
+    console.log("📧 [AUTO-COMPLETE] Emails sent.");
 
     res.json({
       success: true,
-      message: `Auto-complete finished: ${releasedCount} released, ${failed.length} failed.`,
-      failed,
+      message: `Ride auto-completed and driver credited $${finalPayout}.`,
     });
   } catch (err) {
-    console.error("❌ Auto-complete error:", err);
-    res.status(500).json({ error: "Auto-complete process failed" });
+    console.error("❌ [AUTO-COMPLETE] Error:", err);
+    res.status(500).json({ error: "Auto-complete failed" });
   }
 });
 

@@ -1,3 +1,4 @@
+// models/Ride.js
 const mongoose = require("mongoose");
 
 const StopSchema = new mongoose.Schema({
@@ -22,13 +23,14 @@ const PassengerSchema = new mongoose.Schema({
 });
 
 const RideSchema = new mongoose.Schema({
+  // ✅ Worker offering the ride
   workerId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "Worker",
     required: true,
   },
 
-  // ✅ Ride details
+  // ✅ Basic ride details
   from: { type: String, required: true },
   to: { type: String, required: true },
   date: { type: String, required: true }, // yyyy-mm-dd
@@ -37,7 +39,7 @@ const RideSchema = new mongoose.Schema({
   seatsAvailable: { type: Number, required: true },
   pickupLocation: { type: String, required: true },
 
-  // ✅ Stops along the way
+  // ✅ Stops
   stops: [StopSchema],
 
   // ✅ Car picture
@@ -50,6 +52,7 @@ const RideSchema = new mongoose.Schema({
     default: {},
   },
 
+  // ✅ Ride type
   bookingType: {
     type: String,
     enum: ["manual", "instant"],
@@ -57,33 +60,51 @@ const RideSchema = new mongoose.Schema({
   },
 
   dropOffNotes: { type: String, default: "" },
-
   passengers: [PassengerSchema],
 
+  // ✅ User who booked (customer)
   bookedBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "User",
     default: null,
   },
 
-  // ✅ Main ride lifecycle
+  // ✅ Lifecycle
   status: {
     type: String,
     enum: [
-      "active",       // live and visible to customers
-      "pending",      // waiting for driver or passengers
-      "accepted",     // driver accepted bookings
-      "completed",    // ride done, awaiting cleanup
-      "cancelled",    // cancelled manually
+      "active",
+      "pending",
+      "accepted",
+      "completed",
+      "cancelled",
     ],
     default: "active",
   },
 
   finalPrice: { type: Number, default: 0 },
 
-  // ✅ Added: flags for payout and visibility
-  isPaidOut: { type: Boolean, default: false },  // true once payment released to driver
-  isArchived: { type: Boolean, default: false }, // hide from both sides after cleanup
+  // ✅ Payment + Wallet Info
+  paymentStatus: {
+    type: String,
+    enum: ["unpaid", "held", "paid", "refunded"],
+    default: "unpaid",
+  },
+
+  stripePaymentIntentId: { type: String, default: "" },
+
+  // ✅ Payout Tracking
+  payoutAmount: { type: Number, default: 0 },
+  payoutDate: { type: Date, default: null },
+  payoutStatus: {
+    type: String,
+    enum: ["pending", "processing", "completed", "failed"],
+    default: "pending",
+  },
+
+  // ✅ Control flags
+  isPaidOut: { type: Boolean, default: false },  // true once Stripe payout done
+  isArchived: { type: Boolean, default: false }, // hidden after cleanup
 
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now },

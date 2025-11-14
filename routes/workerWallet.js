@@ -52,7 +52,7 @@ router.get("/wallet/:workerId", async (req, res) => {
 });
 
 // =====================================================
-// ✅ POST Worker Withdrawal Request
+// ✅ POST Worker Withdrawal Request (with Stripe $2 Fee)
 // =====================================================
 router.post("/request-withdrawal", async (req, res) => {
   const { workerId, amount, method } = req.body;
@@ -61,11 +61,25 @@ router.post("/request-withdrawal", async (req, res) => {
     const worker = await Worker.findById(workerId);
     if (!worker) return res.status(404).json({ error: "Worker not found" });
 
-    if (amount > worker.walletBalance) {
+    let finalAmount = amount;
+    let feeApplied = 0;
+
+    // ⚙️ Apply Stripe Instant Payout Fee
+    if (method === "Stripe Instant Payout") {
+      feeApplied = 2; // $2 fee
+      finalAmount = amount - feeApplied;
+      if (finalAmount <= 0) {
+        return res.status(400).json({
+          error: "Withdrawal amount must be greater than $2 after fee deduction",
+        });
+      }
+    }
+
+    if (finalAmount > worker.walletBalance) {
       return res.status(400).json({ error: "Insufficient funds" });
     }
 
-    // 🔹 Deduct immediately (hold funds)
+    // 🔹 Deduct from wallet
     worker.walletBalance -= amount;
 
     const withdrawalRecord = {
@@ -74,14 +88,13 @@ router.post("/request-withdrawal", async (req, res) => {
       jobId: null,
       date: new Date(),
       released: true,
-      notes: `Withdrawal via ${method}`,
+      notes: `Withdrawal via ${method}${feeApplied ? ` (includes $${feeApplied} fee)` : ""}`,
     };
 
     worker.walletHistory.push(withdrawalRecord);
-
     await worker.save();
 
-    console.log(`💸 Withdrawal request from ${worker.name}: $${amount} via ${method}`);
+    console.log(`💸 Withdrawal from ${worker.name}: $${amount} (${method})`);
 
     // =====================================================
     // 🔹 Handle Payout Type
@@ -89,27 +102,30 @@ router.post("/request-withdrawal", async (req, res) => {
     switch (method) {
       case "Stripe Instant Payout":
         try {
-          // ⚙️ NOTE: Worker must have connected Stripe account set up in onboarding
           if (!worker.stripeAccountId) {
             throw new Error("Worker not connected to Stripe account");
           }
 
           const transfer = await stripe.transfers.create({
-            amount: Math.round(amount * 100),
+            amount: Math.round(finalAmount * 100), // after fee
             currency: "cad",
             destination: worker.stripeAccountId,
-            description: `BYN Payout to ${worker.name}`,
+            description: `BYN Payout to ${worker.name} (after $${feeApplied} fee)`,
           });
 
           console.log(`✅ Stripe payout completed: ${transfer.id}`);
 
-          // Email confirmation
           await sendEmailSafe({
             to: worker.email,
-            subject: "💸 Stripe Instant Payout Processed",
+            subject: "💸 Stripe Instant Payout Sent",
             html: `
               <h2>Hi ${worker.name},</h2>
-              <p>Your payout of <strong>$${amount.toFixed(2)}</strong> has been sent to your connected Stripe account.</p>
+              <p>Your payout of <strong>$${finalAmount.toFixed(
+                2
+              )}</strong> has been transferred to your Stripe account.</p>
+              <p>A $${feeApplied.toFixed(
+                2
+              )} instant payout fee was applied.</p>
               <p>Transfer ID: ${transfer.id}</p>
               <br/>
               <p>— Book Your Need</p>
@@ -125,7 +141,6 @@ router.post("/request-withdrawal", async (req, res) => {
         break;
 
       case "Interac e-Transfer":
-        // ⚙️ For now: log + email admin to handle manually (RBC / Wise API later)
         await sendEmailSafe({
           to: process.env.ADMIN_EMAIL || "admin@bookyourneed.com",
           subject: "📩 New Interac e-Transfer Request",
@@ -135,20 +150,17 @@ router.post("/request-withdrawal", async (req, res) => {
             <p><strong>Email:</strong> ${worker.email}</p>
             <p><strong>Amount:</strong> $${amount.toFixed(2)}</p>
             <p><strong>Requested:</strong> ${new Date().toLocaleString()}</p>
-            <br/>
-            <p>Process manually via Interac / RBC / Wise API.</p>
           `,
         });
-
         await sendEmailSafe({
           to: worker.email,
           subject: "💸 Interac e-Transfer Request Received",
           html: `
             <h2>Hi ${worker.name},</h2>
-            <p>Your request for an Interac e-Transfer payout of <strong>$${amount.toFixed(
+            <p>Your request for <strong>$${amount.toFixed(
               2
             )}</strong> has been received.</p>
-            <p>Our finance team will send your payment within 1–2 business days.</p>
+            <p>Expect funds within 1–2 business days.</p>
             <br/>
             <p>— Book Your Need</p>
           `,
@@ -156,7 +168,6 @@ router.post("/request-withdrawal", async (req, res) => {
         break;
 
       case "Bank Deposit":
-        // ⚙️ Future integration (Plaid / Stripe payouts)
         await sendEmailSafe({
           to: process.env.ADMIN_EMAIL || "admin@bookyourneed.com",
           subject: "🏦 New Bank Deposit Request",
@@ -166,20 +177,17 @@ router.post("/request-withdrawal", async (req, res) => {
             <p><strong>Email:</strong> ${worker.email}</p>
             <p><strong>Amount:</strong> $${amount.toFixed(2)}</p>
             <p><strong>Requested:</strong> ${new Date().toLocaleString()}</p>
-            <br/>
-            <p>Process manually via Stripe or RBC ACH deposit.</p>
           `,
         });
-
         await sendEmailSafe({
           to: worker.email,
           subject: "🏦 Bank Deposit Request Received",
           html: `
             <h2>Hi ${worker.name},</h2>
-            <p>Your request for a bank deposit of <strong>$${amount.toFixed(
+            <p>Your request for <strong>$${amount.toFixed(
               2
             )}</strong> has been received.</p>
-            <p>Funds will be deposited into your account within 2–3 business days.</p>
+            <p>Funds will arrive within 2–3 business days.</p>
             <br/>
             <p>— Book Your Need</p>
           `,
@@ -187,11 +195,10 @@ router.post("/request-withdrawal", async (req, res) => {
         break;
 
       default:
-        console.warn("⚠️ Unknown withdrawal method:", method);
         return res.status(400).json({ error: "Invalid withdrawal method" });
     }
 
-    // ✅ Notify admin globally
+    // ✅ Notify Admin
     await sendEmailSafe({
       to: process.env.ADMIN_EMAIL || "admin@bookyourneed.com",
       subject: "📢 Worker Withdrawal Processed",
@@ -201,13 +208,20 @@ router.post("/request-withdrawal", async (req, res) => {
         <p><strong>Email:</strong> ${worker.email}</p>
         <p><strong>Amount:</strong> $${amount.toFixed(2)}</p>
         <p><strong>Method:</strong> ${method}</p>
+        ${
+          feeApplied
+            ? `<p><strong>Stripe Fee:</strong> $${feeApplied.toFixed(2)}</p>`
+            : ""
+        }
         <p>Processed at ${new Date().toLocaleString()}</p>
       `,
     });
 
     res.status(200).json({
       success: true,
-      message: `Withdrawal request processed via ${method}`,
+      message: `Withdrawal via ${method} processed${
+        feeApplied ? ` (Fee: $${feeApplied})` : ""
+      }`,
     });
   } catch (err) {
     console.error("❌ Withdrawal request error:", err);
