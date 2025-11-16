@@ -29,6 +29,11 @@ const { initSocket } = require("./socket");
 const io = initSocket(server);
 app.set("socketio", io);
 
+// 🔥 REQUIRED FOR RIDE PRIVATE CHAT TO WORK
+app.use((req, res, next) => {
+  req.io = io;
+  next();
+});
 // =====================================================
 // 🗂️ Multer Setup (for uploads)
 // =====================================================
