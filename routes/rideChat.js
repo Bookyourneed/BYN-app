@@ -43,76 +43,72 @@ router.get("/:rideId", async (req, res) => {
   }
 });
 
-// ✅ POST: Send a message + email notification (fixed driver email logic)
+// ✅ POST: Send a message (PRIVATE ROOM + Email Notification)
 router.post("/send", async (req, res) => {
   try {
-    const { rideId, senderId, senderModel, text } = req.body;
+    const { rideId, roomId, senderId, senderModel, text } = req.body;
 
-    if (!rideId || !senderId || !senderModel || !text)
+    if (!rideId || !roomId || !senderId || !senderModel || !text)
       return res.status(400).json({ error: "Missing required fields" });
 
     if (!text.trim())
       return res.status(400).json({ error: "Message cannot be empty" });
 
-    const { sendRideEmail } = require("../emailService");
     const io = req.app.get("socketio");
+    const { sendRideEmail } = require("../emailService");
 
-    // 🔹 Find or create chat
-    let chat = await RideChat.findOne({ rideId });
-    const ride = await Ride.findById(rideId).populate("workerId", "name email").lean();
+    // Fetch ride
+    const ride = await Ride.findById(rideId)
+      .populate("workerId", "name email")
+      .lean();
     if (!ride) return res.status(404).json({ error: "Ride not found" });
 
+    // Find or create chat thread
+    let chat = await RideChat.findOne({ rideId });
     if (!chat) {
-      const booking = await BookingRequest.findOne({
-        rideId,
-        status: { $in: ["pending", "accepted"] },
-      });
       chat = new RideChat({
         rideId,
-        customerId: senderModel === "User" ? senderId : booking?.customerId || ride.bookedBy,
+        customerId:
+          senderModel === "User"
+            ? senderId
+            : ride.bookedBy, // fallback
         workerId: ride.workerId?._id,
         messages: [],
       });
     }
 
-    // 🔹 Ensure chat always has a customerId
-    if (!chat.customerId) {
-      const booking = await BookingRequest.findOne({ rideId });
-      if (booking) chat.customerId = booking.customerId;
-      else if (ride.bookedBy) chat.customerId = ride.bookedBy;
+    // Ensure chat has customer
+    if (!chat.customerId) chat.customerId = ride.bookedBy;
+
+    // Fetch sender document
+    let senderDoc = null;
+    if (senderModel === "User") {
+      senderDoc = await User.findById(senderId).select(
+        "name email profilePhotoUrl"
+      );
+    } else {
+      senderDoc = await Worker.findById(senderId).select(
+        "name email profilePhotoUrl"
+      );
     }
 
-    // 🔹 Fetch sender and receiver
-    let senderDoc = null;
+    // Decide email recipient
     let receiverEmail = null;
     let receiverName = null;
 
     if (senderModel === "User") {
-      senderDoc = await User.findById(senderId).select("name profilePhotoUrl email");
-      const worker = await Worker.findById(ride.workerId).select("name email");
-      receiverEmail = worker?.email;
-      receiverName = worker?.name;
+      receiverEmail = ride.workerId?.email;
+      receiverName = ride.workerId?.name;
     } else {
-      senderDoc = await Worker.findById(senderId).select("name profilePhotoUrl email");
-
-      // Try to get the customer via chat, booking, or ride.bookedBy
-      let customer = null;
-
-      if (chat.customerId)
-        customer = await User.findById(chat.customerId).select("name email");
-      if (!customer) {
-        const booking = await BookingRequest.findOne({ rideId })
-          .populate("customerId", "name email");
-        customer = booking?.customerId;
-      }
-      if (!customer && ride.bookedBy)
-        customer = await User.findById(ride.bookedBy).select("name email");
-
-      receiverEmail = customer?.email;
-      receiverName = customer?.name;
+      // sender is worker → email customer
+      const customerData = await User.findById(chat.customerId).select(
+        "name email"
+      );
+      receiverEmail = customerData?.email;
+      receiverName = customerData?.name;
     }
 
-    // 🔹 New message
+    // Create message
     const newMsg = {
       sender: senderId,
       senderModel,
@@ -126,50 +122,58 @@ router.post("/send", async (req, res) => {
     chat.lastMessageAt = new Date();
     await chat.save();
 
-    // 🔹 Flatten for frontend
+    // Flatten for frontend
     const flatMsg = {
       senderId,
       senderModel,
-      senderName: senderDoc?.name || "Passenger",
+      senderName: senderDoc?.name,
       senderPhoto: senderDoc?.profilePhotoUrl || null,
       text,
       timestamp: newMsg.timestamp,
       seen: false,
     };
 
-    // 🔹 Emit to sockets
-    io.to(`ride_${rideId}`).emit("ride-message", { rideId, message: flatMsg });
+    // 🔥 Emit to PRIVATE ROOM (NOT ride_ room)
+    io.to(roomId).emit("ride-message", {
+      roomId,
+      rideId,
+      message: flatMsg,
+    });
 
-    if (senderModel === "User") {
-      io.to(`ride_${rideId}`).emit("ride-chat-update", {
-        rideId,
-        customerId: senderId,
-        name: senderDoc?.name || "Passenger",
-        profilePhotoUrl: senderDoc?.profilePhotoUrl || null,
-        lastMessage: text,
-        timestamp: newMsg.timestamp,
-      });
-    }
+    io.to(roomId).emit("ride-chat-update", {
+      roomId,
+      rideId,
+      lastMessage: text,
+      timestamp: newMsg.timestamp,
+      senderId,
+      senderName: senderDoc?.name,
+      senderPhoto: senderDoc?.profilePhotoUrl,
+    });
 
-    // 🔹 Email (safe & non-self)
+    // 🔥 Email Notification (only if receiver exists)
     if (receiverEmail && receiverEmail !== senderDoc?.email) {
-      await sendRideEmail("rideChatMessage", {
+      await sendRideEmail("rideRequest", {
         to: receiverEmail,
+        customerName:
+          senderModel === "User" ? senderDoc?.name : receiverName,
+        driverName:
+          senderModel === "Worker" ? senderDoc?.name : receiverName,
         from: ride.from,
         toLocation: ride.to,
-        customerName: senderModel === "User" ? senderDoc?.name : receiverName,
-        driverName: senderModel === "Worker" ? senderDoc?.name : receiverName,
         date: ride.date,
         time: ride.time,
       });
-      console.log(`📧 Chat email sent to ${receiverEmail}`);
+      console.log("📧 Chat email sent:", receiverEmail);
     } else {
-      console.log(`⚠️ No valid receiver email found for chat message`);
+      console.log("⚠️ No valid receiver email found for chat message");
     }
 
-    res.status(200).json({ success: true, message: flatMsg });
+    res.status(200).json({
+      success: true,
+      message: flatMsg,
+    });
   } catch (err) {
-    console.error("❌ Error sending ride chat:", err);
+    console.error("❌ Ride chat send error:", err);
     res.status(500).json({ error: "Failed to send ride chat message" });
   }
 });

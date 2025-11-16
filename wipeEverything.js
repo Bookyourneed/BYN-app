@@ -10,27 +10,41 @@ const User = require("./models/User");
 const Worker = require("./models/Worker");
 const Job = require("./models/Job");
 const Bid = require("./models/Bid");
-const Chat = require("./models/Chat");           // ✅ added
-const RideChat = require("./models/RideChat");   // Optional
-const Notification = require("./models/Notification"); // Optional
+const Chat = require("./models/Chat");
+const RideChat = require("./models/RideChat");
+const Notification = require("./models/Notification");
+const Ride = require("./models/Ride");                // 🔥 added
+const BookingRequest = require("./models/BookingRequest"); // 🔥 added
+const CustomerRequest = require("./models/CustomerRequest"); // 🔥 added
 
+// 🧨 Delete ALL uploaded files (FULL uploads wipe)
 const wipeUploads = () => {
-  const uploadDirs = ["uploads/certifications", "uploads/ids", "uploads/cars"];
+  const uploadsRoot = path.join(__dirname, "uploads");
 
-  uploadDirs.forEach((dir) => {
-    const fullPath = path.join(__dirname, dir);
-    if (fs.existsSync(fullPath)) {
-      fs.readdir(fullPath, (err, files) => {
-        if (err) return console.error(`❌ Error reading ${dir}:`, err);
+  if (!fs.existsSync(uploadsRoot)) {
+    console.log("⚠️ No uploads folder found.");
+    return;
+  }
 
-        for (const file of files) {
-          fs.unlink(path.join(fullPath, file), (err) => {
-            if (err) console.error(`❌ Failed to delete ${file} in ${dir}:`, err);
-          });
+  console.log("🧹 Wiping ALL uploaded files...");
+
+  const deleteFolderRecursive = (folderPath) => {
+    if (fs.existsSync(folderPath)) {
+      fs.readdirSync(folderPath).forEach((file) => {
+        const curPath = path.join(folderPath, file);
+
+        if (fs.lstatSync(curPath).isDirectory()) {
+          deleteFolderRecursive(curPath);
+        } else {
+          fs.unlinkSync(curPath);
         }
       });
+      fs.rmdirSync(folderPath);
     }
-  });
+  };
+
+  deleteFolderRecursive(uploadsRoot);
+  console.log("🗑️ /uploads folder fully deleted.");
 };
 
 async function wipeAll() {
@@ -43,20 +57,23 @@ async function wipeAll() {
       Worker.deleteMany({}),
       Job.deleteMany({}),
       Bid.deleteMany({}),
-      Chat.deleteMany({}),           // ✅ wipe chats
-      RideChat?.deleteMany?.({}),
-      Notification?.deleteMany?.({})
+      Chat.deleteMany({}),
+      RideChat.deleteMany({}),
+      Notification.deleteMany({}),
+      Ride.deleteMany({}),
+      BookingRequest.deleteMany({}),
+      CustomerRequest.deleteMany({})
     ]);
 
-    console.log("✅ Database wiped: Users, Workers, Jobs, Bids, Chats, RideChats, Notifications");
+    console.log("🔥 Database wiped clean:");
+    console.log("   Users, Workers, Jobs, Bids, Chats, RideChats");
+    console.log("   Rides, BookingRequests, CustomerRequests, Notifications");
 
     wipeUploads();
-    console.log("🧹 Uploaded files cleaned from /uploads");
 
-    setTimeout(() => {
-      console.log("✅ Everything wiped successfully. Exiting...");
-      process.exit(0);
-    }, 1000);
+    console.log("✨ Everything wiped successfully. Fresh start ready!");
+
+    setTimeout(() => process.exit(0), 1000);
   } catch (err) {
     console.error("❌ Wipe failed:", err);
     process.exit(1);
