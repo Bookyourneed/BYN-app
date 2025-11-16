@@ -94,6 +94,24 @@ async function sendJobEmail(type, data) {
   if (!t) return console.warn("⚠️ Unknown job email type:", type);
   await sendEmailSafe({ to, subject: t.subject, html: t.html, context: `job-${type}` });
 }
+// ===========================================
+// 💬 Chat Message Email Notifications
+// ===========================================
+async function sendChatEmail({ to, senderName, message }) {
+  return sendEmailSafe({
+    to,
+    subject: `💬 New Chat Message from ${senderName}`,
+    html: generateEmailHTML(
+      "New Chat Message",
+      `<p>You received a new message from <b>${senderName}</b>:</p>
+       <blockquote style="border-left:4px solid #ccc;padding-left:10px;margin:10px 0;">
+         ${message}
+       </blockquote>
+       <p>Please reply inside the BYN app.</p>`
+    ),
+    context: "chat-message",
+  });
+}
 
 // ===========================================
 // 🚗 Ride Email Templates
@@ -175,5 +193,6 @@ module.exports = {
   sendEmailSafe,
   sendJobEmail,
   sendRideEmail,
+  sendChatEmail,
   sendSupportEmail,
 };
