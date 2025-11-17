@@ -2,7 +2,7 @@ const express = require("express");
 const router = express.Router();
 
 const RideChat = require("../models/RideChat");
-const Ride = require("../models/Ride");        // ✅ FIXED
+const Ride = require("../models/Ride");
 const User = require("../models/User");
 const Worker = require("../models/Worker");
 
@@ -13,7 +13,7 @@ const norm = (id) =>
   typeof id === "string" ? id : id?._id || id?.id || "";
 
 /* ======================================================
-   🟣 WORKER — List all passengers they chatted with
+   🟣 WORKER — List all passengers worker chatted with
 ====================================================== */
 router.get("/participants/:workerId", async (req, res) => {
   try {
@@ -41,7 +41,7 @@ router.get("/participants/:workerId", async (req, res) => {
 });
 
 /* ======================================================
-   🟦  CUSTOMER — Get chat (rideId + ?customerId)
+   🟦 CUSTOMER — Load chat by rideId + customerId
    Example → /api/ride-chat/123?customerId=321
 ====================================================== */
 router.get("/:rideId", async (req, res) => {
@@ -57,6 +57,7 @@ router.get("/:rideId", async (req, res) => {
       .populate("customerId", "name email profilePhotoUrl")
       .populate("workerId", "name email profilePhotoUrl");
 
+    // If no chat exists → create new one
     if (!chat) {
       const ride = await Ride.findById(rideId);
       if (!ride) return res.status(404).json({ error: "Ride not found" });
@@ -87,11 +88,10 @@ router.get("/:rideId", async (req, res) => {
 });
 
 /* ======================================================
-   🟩  SEND MESSAGE (socket + 🌟 EMAIL NOTIFICATION)
+   🟩 SEND MESSAGE (socket + EMAIL NOTIFICATION)
 ====================================================== */
 
-// 5-minute cooldown map
-const chatCooldown = new Map();
+const chatCooldown = new Map(); // 5 min cooldown
 
 router.post("/send", async (req, res) => {
   try {
@@ -100,11 +100,11 @@ router.post("/send", async (req, res) => {
     if (!rideId || !roomId || !senderId || !text)
       return res.status(400).json({ error: "Missing fields" });
 
-    // roomId format → "rideId-customerId-workerId"
     const parts = roomId.split("-");
     const customerId = parts[1];
+    const workerId = parts[2];
 
-    if (!customerId)
+    if (!customerId || !workerId)
       return res.status(400).json({ error: "Invalid roomId" });
 
     let chat = await RideChat.findOne({ rideId, customerId })
@@ -116,7 +116,7 @@ router.post("/send", async (req, res) => {
       chat = await RideChat.create({
         rideId,
         customerId,
-        workerId: chat?.rideId?.workerId,
+        workerId,
         messages: [],
       });
 
@@ -128,7 +128,7 @@ router.post("/send", async (req, res) => {
 
     const msg = {
       text,
-      senderId,
+      sender: senderId,          // 👈 IMPORTANT (schema requires "sender")
       senderModel,
       timestamp: new Date(),
     };
@@ -136,47 +136,40 @@ router.post("/send", async (req, res) => {
     chat.messages.push(msg);
     await chat.save();
 
-    /* -----------------------------------------------
-       🔥 SOCKET BROADCAST (PRIVATE ROOM)
-    ------------------------------------------------ */
+    /* ------------------------------------
+       🔥 SOCKET: send message to room
+    ------------------------------------ */
     req.io.to(roomId).emit("ride-message", {
       roomId,
       message: msg,
     });
 
-    /* ===================================================
-       💌 EMAIL NOTIFICATION (every 5 minutes ONLY)
-    ==================================================== */
-
+    /* ------------------------------------
+       💌 EMAIL NOTIFICATION (cooldown)
+    ------------------------------------ */
     const cooldownKey = `${rideId}-${customerId}-${senderModel}`;
     const now = Date.now();
 
     if (!chatCooldown.has(cooldownKey) ||
         now - chatCooldown.get(cooldownKey) > 5 * 60 * 1000) {
       
-      chatCooldown.set(cooldownKey, now); // update cooldown
+      chatCooldown.set(cooldownKey, now);
 
       const rideFrom = chat.rideId?.from;
       const rideTo = chat.rideId?.to;
 
       if (senderModel === "User") {
         // CUSTOMER → DRIVER
-        await sendChatEmail("messageToDriver", {
+        await sendChatEmail({
           to: chat.workerId.email,
           senderName: chat.customerId.name,
-          receiverName: chat.workerId.name,
-          rideFrom,
-          rideTo,
           message: text,
         });
-      } else if (senderModel === "Worker") {
+      } else {
         // DRIVER → CUSTOMER
-        await sendChatEmail("messageToCustomer", {
+        await sendChatEmail({
           to: chat.customerId.email,
           senderName: chat.workerId.name,
-          receiverName: chat.customerId.name,
-          rideFrom,
-          rideTo,
           message: text,
         });
       }
@@ -190,7 +183,7 @@ router.post("/send", async (req, res) => {
 });
 
 /* ======================================================
-   🟥 CUSTOMER — List all their ride chats
+   🟥 CUSTOMER — List ALL chats (YourTrips)
 ====================================================== */
 router.get("/my-chats/:customerId", async (req, res) => {
   try {
