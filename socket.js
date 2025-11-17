@@ -252,7 +252,15 @@ function initSocket(server) {
       if (!rid) return;
       io.to(rid).emit("receiveMessage", message);
     });
-
+    /* ================================================== */
+/* PRIVATE RIDE CHAT ROOM (1–1 Chat) */
+/* ================================================== */
+socket.on("join-private-ride-chat", ({ roomId }) => {
+  const rid = toStr(roomId);
+  if (!rid) return;
+  console.log("👥 Joined private ride chat:", rid);
+  socket.join(rid);
+});
     socket.on("typing", (data = {}) => {
       const rid = toStr(data.roomId);
       if (!rid) return;

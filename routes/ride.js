@@ -541,13 +541,15 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// ✅ GET: Requests + Chats (deduplicated, auto-fix missing names)
+/* ======================================================
+   📩 GET: Ride Requests + Chats (MULTI-CUSTOMER SUPPORT)
+====================================================== */
 router.get("/:rideId/requests-and-chats", async (req, res) => {
   try {
     const { rideId } = req.params;
     console.log("📡 Fetching requests and chats for rideId:", rideId);
 
-    // 1️⃣ Fetch ride details
+    // 1️⃣ Fetch ride
     const ride = await Ride.findById(rideId).lean();
     if (!ride) return res.status(404).json({ error: "Ride not found" });
 
@@ -555,7 +557,7 @@ router.get("/:rideId/requests-and-chats", async (req, res) => {
     console.log("📅 Today's date:", today);
     console.log("🛣️ Ride date:", ride.date);
 
-    // 2️⃣ Fetch booking requests (pending / active / accepted)
+    // 2️⃣ Fetch booking requests
     const requests = await BookingRequest.find({
       rideId,
       status: { $in: ["pending", "active", "accepted"] },
@@ -566,16 +568,20 @@ router.get("/:rideId/requests-and-chats", async (req, res) => {
 
     console.log("✅ Booking requests found:", requests.length);
 
-    // 3️⃣ Fetch ride chat with sender info
-    let rideChat = await RideChat.findOne({ rideId })
+    // 3️⃣ Fetch *ALL* ride chats
+    const rideChats = await RideChat.find({ rideId })
       .populate("messages.sender", "name profilePhotoUrl email")
       .lean();
 
+    console.log("💬 Total chat threads:", rideChats.length);
+
     let chatParticipants = [];
 
-    if (rideChat && rideChat.messages?.length) {
-      // ✅ Repair missing sender info for messages (auto-populate)
-      for (const msg of rideChat.messages) {
+    for (const chat of rideChats) {
+      if (!chat.messages?.length) continue;
+
+      // Auto-repair missing sender fields
+      for (const msg of chat.messages) {
         if (
           msg.senderModel === "User" &&
           (!msg.sender?.name || !msg.sender?.profilePhotoUrl)
@@ -593,14 +599,16 @@ router.get("/:rideId/requests-and-chats", async (req, res) => {
         }
       }
 
-      // ✅ Deduplicate by sender (latest message only)
-      const customerMsgs = rideChat.messages.filter(
+      // Get ALL messages from customer
+      const customerMsgs = chat.messages.filter(
         (m) => m.senderModel === "User"
       );
 
       const map = new Map();
+
       customerMsgs.forEach((m) => {
         const id = String(m.sender?._id || m.sender);
+
         const existing = map.get(id);
         if (!existing || new Date(m.timestamp) > new Date(existing.timestamp)) {
           map.set(id, {
@@ -613,18 +621,19 @@ router.get("/:rideId/requests-and-chats", async (req, res) => {
         }
       });
 
-      chatParticipants = [...map.values()];
+      chatParticipants.push(...map.values());
     }
 
-    // 4️⃣ Filter out users who already have requests
+    // 4️⃣ Remove users that already sent ride requests
     const requestIds = new Set(
       requests.map((r) => String(r.customerId?._id || r.customerId))
     );
+
     chatParticipants = chatParticipants.filter(
       (c) => !requestIds.has(String(c.customerId))
     );
 
-    // ✅ Final response
+    // 5️⃣ Final response
     res.json({
       ride,
       requests,
@@ -635,7 +644,6 @@ router.get("/:rideId/requests-and-chats", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch ride requests+chats" });
   }
 });
-
 
 
 module.exports = router;
