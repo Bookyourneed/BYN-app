@@ -13,13 +13,11 @@ const BookingRequest = require("../models/BookingRequest");
 const { getIO } = require("../socket"); // ✅ adjust path if needed
 
 
-
-
 // =====================================================
 // ✅ 1️⃣ Create PaymentIntent (Hold funds in escrow)
 // =====================================================
 router.post("/create-intent", async (req, res) => {
-  const { rideId, customerId } = req.body;
+  const { rideId, customerId, seatsRequested = 1 } = req.body;
 
   try {
     const ride = await Ride.findById(rideId);
@@ -28,7 +26,7 @@ router.post("/create-intent", async (req, res) => {
     if (!ride || !customer)
       return res.status(404).json({ error: "Ride or Customer not found" });
 
-    // Create Stripe customer if missing
+    // 🔐 Stripe Customer
     if (!customer.stripeCustomerId) {
       const stripeCustomer = await stripe.customers.create({
         email: customer.email,
@@ -38,55 +36,78 @@ router.post("/create-intent", async (req, res) => {
       await customer.save();
     }
 
-    // 💰 Add $4.99 booking fee
-    const basePrice = Number(ride.price);
+    // 💰 Calculate seat price
+    const basePrice = Number(ride.pricePerSeat) * seatsRequested;   // ✅ FIX
     const bookingFee = 4.99;
     const total = parseFloat((basePrice + bookingFee).toFixed(2));
 
-    // 💳 Create PaymentIntent (manual capture = hold funds)
+    // 💳 PaymentIntent (manual capture)
     const paymentIntent = await stripe.paymentIntents.create({
       amount: Math.round(total * 100),
       currency: "cad",
       customer: customer.stripeCustomerId,
-      capture_method: "manual", // ✅ hold payment
+      capture_method: "manual",
       automatic_payment_methods: { enabled: true, allow_redirects: "never" },
-      description: `Ride booking ${ride.from} → ${ride.to} ($${basePrice} + $4.99 fee)`,
-      metadata: { rideId, customerId, basePrice, bookingFee, total },
+      description: `Seat booking for ride ${ride.from} → ${ride.to}`,
+      metadata: {
+        rideId,
+        customerId,
+        basePrice,
+        bookingFee,
+        seatsRequested,
+        total,
+      },
     });
 
-    res.json({
+    return res.json({
       success: true,
       clientSecret: paymentIntent.client_secret,
       paymentIntentId: paymentIntent.id,
       basePrice,
       bookingFee,
+      seatsRequested,
       total,
     });
+
   } catch (err) {
     console.error("❌ Create-intent error:", err.message);
-    res.status(500).json({ error: "Failed to create payment intent" });
+    return res.status(500).json({ error: "Failed to create payment intent" });
   }
 });
+
+
 // =====================================================
 // ✅ Step 2: Confirm booking AFTER successful payment
 //      + Socket + Email notify driver
 // =====================================================
 router.post("/confirm-booking", async (req, res) => {
   try {
-    const { rideId, customerId, from, to, message, paymentIntentId } = req.body;
+    const {
+      rideId,
+      customerId,
+      from,
+      to,
+      message,
+      paymentIntentId,
+      seatsRequested = 1,
+    } = req.body;
 
     if (!rideId || !customerId || !paymentIntentId) {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
-    // Core docs
+    // Fetch ride & customer
     const ride = await Ride.findById(rideId).populate("workerId", "name email");
     if (!ride) return res.status(404).json({ error: "Ride not found" });
 
     const customer = await User.findById(customerId).select("name email");
     if (!customer) return res.status(404).json({ error: "Customer not found" });
 
-    // Upsert booking (status set to pending after Stripe success)
+    // Booking price
+    const seatPrice = Number(ride.pricePerSeat);
+    const finalPrice = seatPrice * seatsRequested;
+
+    // Create / update booking
     const booking = await BookingRequest.findOneAndUpdate(
       { rideId, customerId },
       {
@@ -95,23 +116,21 @@ router.post("/confirm-booking", async (req, res) => {
           customerId,
           from,
           to,
-          price: ride.price,
+          seatsRequested,
+          price: finalPrice,
           message,
-          status: "pending",
           paymentIntentId,
-          escrowStatus: "on_hold",
-          rideStatus: "pending",
+          requestStatus: "pending",
           updatedAt: new Date(),
         },
       },
       { upsert: true, new: true }
     );
 
-    // --- Realtime + Email ---
+    // SOCKET + EMAIL
     const io = req.app.get("socketio");
     const { sendRideEmail } = require("../emailService");
 
-    // Payload summary for UIs
     const payload = {
       bookingId: booking._id,
       rideId,
@@ -119,44 +138,44 @@ router.post("/confirm-booking", async (req, res) => {
       customerName: customer.name,
       driverId: ride.workerId?._id,
       driverName: ride.workerId?.name,
-      from: ride.from,
-      to: ride.to,
-      price: ride.price,
+      from,
+      to,
+      pricePerSeat: seatPrice,
+      seatsRequested,
+      total: finalPrice,
       date: ride.date,
       time: ride.time,
       message,
-      status: booking.status,
-      escrowStatus: booking.escrowStatus,
-      rideStatus: booking.rideStatus,
+      requestStatus: booking.requestStatus,
       createdAt: booking.createdAt,
       updatedAt: booking.updatedAt,
     };
 
-    // 1) Notify everyone in the ride room
+    // Notify ride room
     io.to(`ride_${rideId}`).emit("ride-request:new", payload);
 
-    // 2) Notify the driver (personal ride channel)
+    // Notify driver
     if (ride.workerId?._id) {
       io.to(`ride_driver_${ride.workerId._id}`).emit("ride-request:driver", payload);
     }
 
-    // 3) Notify the customer (personal ride channel) for UI confirmation
+    // Notify customer
     io.to(`ride_customer_${customerId}`).emit("ride-request:customer", payload);
 
-    // 4) Email the driver about the new request
+    // Email the driver (YES we keep this!)
     if (ride.workerId?.email) {
       await sendRideEmail("rideRequest", {
         to: ride.workerId.email,
         customerName: customer.name,
         driverName: ride.workerId.name,
-        from: ride.from,
-        toLocation: ride.to,
+        from,
+        toLocation: to,
         date: ride.date,
         time: ride.time,
       });
     }
 
-    res.json({ success: true, booking });
+    return res.json({ success: true, booking });
   } catch (err) {
     console.error("❌ Confirm booking error:", err);
     res.status(500).json({ error: "Failed to confirm booking" });
@@ -164,54 +183,73 @@ router.post("/confirm-booking", async (req, res) => {
 });
 
 
-// ✅ Cancel ride by worker (refund if applicable) + Email + Socket alerts
+// =====================================================
+// ✅ Step 3: Worker Cancels Ride
+//   Cancels ALL active bookings,
+//   Issues refunds (if paid),
+//   Sends sockets + emails,
+//   Sets ride to cancelled ONLY after all bookings handled
+// =====================================================
 router.post("/cancel-by-worker", async (req, res) => {
   try {
     const { rideId, workerId } = req.body;
     const io = req.app.get("socketio");
     const { sendRideEmail } = require("../emailService");
 
+    if (!rideId || !workerId) {
+      return res.status(400).json({ error: "Missing rideId or workerId" });
+    }
+
+    // Fetch ride
     const ride = await Ride.findById(rideId)
       .populate("workerId", "name email")
       .lean();
 
     if (!ride) return res.status(404).json({ error: "Ride not found" });
 
-    // 🧩 Find all active or pending requests for this ride
-    const requests = await BookingRequest.find({
+    if (String(ride.workerId?._id) !== String(workerId)) {
+      return res.status(403).json({ error: "You are not authorized to cancel this ride" });
+    }
+
+    // Find all bookings that are pending or accepted (meaning seats were held)
+    const bookings = await BookingRequest.find({
       rideId,
-      status: { $in: ["pending", "accepted", "active"] },
+      requestStatus: { $in: ["pending", "accepted"] }
     }).populate("customerId", "name email");
 
-    console.log(`🚫 Worker cancelled ride ${rideId}. ${requests.length} passengers affected.`);
+    console.log(`🚫 Worker cancelled ride ${rideId}. ${bookings.length} bookings affected.`);
 
-    for (const req of requests) {
-      // --- Refund or cancel logic ---
-      if (req.status === "accepted" || req.escrowStatus === "on_hold") {
-        // 💳 Stripe refund (mocked)
-        // await stripe.refunds.create({ payment_intent: req.paymentIntentId });
-        req.status = "refunded";
-        req.rideStatus = "cancelled";
-        req.escrowStatus = "refunded";
-      } else {
-        req.status = "cancelled";
-        req.rideStatus = "cancelled";
+    for (const booking of bookings) {
+      let refunded = false;
+
+      // 💳 Refund if paymentIntent exists (Stripe refund placeholder)
+      if (booking.paymentIntentId) {
+        // await stripe.refunds.create({
+        //   payment_intent: booking.paymentIntentId
+        // });
+
+        refunded = true;
       }
-      await req.save();
 
-      // --- Real-time socket notify customer ---
-      io.to(`ride_customer_${req.customerId._id}`).emit("ride-cancelled", {
+      // Update booking fields
+      booking.requestStatus = refunded ? "refunded" : "cancelled_by_driver";
+      booking.updatedAt = new Date();
+
+      await booking.save();
+
+      // SOCKET → notify customer
+      io.to(`ride_customer_${booking.customerId._id}`).emit("ride-cancelled", {
+        bookingId: booking._id,
         rideId,
-        message: `Your driver ${ride.workerId.name} cancelled the ride from ${ride.from} to ${ride.to}. Refunds (if applicable) will be processed automatically.`,
-        status: req.status,
-        refund: req.escrowStatus === "refunded",
+        refunded,
+        message: `Your driver ${ride.workerId.name} cancelled this ride. ${refunded ? "A refund will be issued automatically." : ""}`
       });
 
-      // --- Email notify customer ---
-      if (req.customerId?.email) {
-        await sendRideEmail("rideDisputed", {
-          to: req.customerId.email,
-          customerName: req.customerId.name,
+      // EMAIL → notify customer
+      if (booking.customerId?.email) {
+        await sendRideEmail("rideCancelled", {
+          to: booking.customerId.email,
+          customerName: booking.customerId.name,
           driverName: ride.workerId.name,
           from: ride.from,
           toLocation: ride.to,
@@ -221,380 +259,597 @@ router.post("/cancel-by-worker", async (req, res) => {
       }
     }
 
-    // --- Update ride status ---
+    // AFTER all bookings handled → cancel the ride globally
     await Ride.findByIdAndUpdate(rideId, { status: "cancelled" });
 
-    // --- Notify driver & admin sockets ---
+    // Notify worker UI
     io.to(`ride_driver_${workerId}`).emit("ride-cancelled:driver", {
       rideId,
       message: "You cancelled this ride. All passengers have been refunded or notified.",
     });
 
+    // Notify ride room
     io.to(`ride_${rideId}`).emit("ride-cancelled:room", {
       rideId,
       status: "cancelled",
     });
 
-    console.log(`📧 Emails sent to all passengers for ride ${rideId}`);
+    console.log(`📧 All cancellation emails sent for ride ${rideId}`);
 
-    res.json({
+    return res.json({
       success: true,
-      message: "Ride cancelled successfully. Refunds issued where applicable.",
+      message: "Ride cancelled. All bookings updated and refunds issued where applicable.",
     });
   } catch (err) {
     console.error("❌ Cancel-by-worker error:", err);
-    res.status(500).json({ error: "Failed to cancel ride" });
+    return res.status(500).json({ error: "Failed to cancel ride" });
   }
 });
 
 
 // =====================================================
-// ✅ Admin release funds
+// ✅ Step 4: Admin manually releases funds to driver
 // =====================================================
 router.post("/rides/:bookingId/release", async (req, res) => {
   try {
-    const booking = await BookingRequest.findById(req.params.bookingId);
-    if (!booking) return res.status(404).json({ error: "Booking not found" });
+    const bookingId = req.params.bookingId;
 
-    const pi = await stripe.paymentIntents.capture(booking.paymentIntentId);
+    // Fetch booking with customer + ride + driver
+    const booking = await BookingRequest.findById(bookingId)
+      .populate("customerId", "name email")
+      .populate("rideId")
+      .exec();
 
-    booking.status = "paid";
-    booking.escrowStatus = "released";
+    if (!booking) {
+      return res.status(404).json({ error: "Booking not found" });
+    }
+
+    const ride = await Ride.findById(booking.rideId)
+      .populate("workerId", "name email stripeAccountId")
+      .exec();
+
+    if (!ride) {
+      return res.status(404).json({ error: "Ride not found" });
+    }
+
+    const driver = ride.workerId;
+
+    // 🔴 Block release if not fully completed
+    if (!booking.customerComplete || !booking.driverComplete) {
+      return res.status(400).json({
+        error: "Both customer and driver must complete the ride before releasing funds.",
+      });
+    }
+
+    // 🔴 Check duplicate payments
+    if (booking.requestStatus === "paid" || booking.driverPaid) {
+      return res.status(400).json({
+        error: "Funds were already released for this booking.",
+      });
+    }
+
+    // 🔐 Stripe capture the PaymentIntent (we held it earlier)
+    const captured = await stripe.paymentIntents.capture(
+      booking.paymentIntentId
+    );
+
+    // 💸 Transfer funds to driver
+    const transferAmount = Math.round(booking.finalPrice * 100); // in cents
+
+    if (!driver.stripeAccountId) {
+      return res.status(400).json({
+        error: "Driver does not have a connected Stripe account.",
+      });
+    }
+
+    const transfer = await stripe.transfers.create({
+      amount: transferAmount,
+      currency: "cad",
+      destination: driver.stripeAccountId,
+    });
+
+    // Update booking
+    booking.requestStatus = "paid";
+    booking.driverPaid = true;
+    booking.paidAt = new Date();
     await booking.save();
 
-    res.json({ success: true, booking, stripePayment: pi });
+    // Check if ALL bookings under this ride are completed & paid
+    const remaining = await BookingRequest.countDocuments({
+      rideId: ride._id,
+      requestStatus: { $ne: "paid" },
+    });
+
+    if (remaining === 0) {
+      ride.status = "completed";
+      await ride.save();
+    }
+
+    // SOCKET NOTIFICATIONS
+    const io = req.app.get("socketio");
+
+    io.to(`ride_driver_${driver._id}`).emit("payout:released", {
+      bookingId,
+      rideId: ride._id,
+      amount: booking.finalPrice,
+      message: "Admin has released your payout.",
+    });
+
+    io.to(`ride_customer_${booking.customerId._id}`).emit(
+      "booking:finalized",
+      {
+        bookingId,
+        rideId: ride._id,
+        message: "Your payment has been finalized and released to the driver.",
+      }
+    );
+
+    // EMAILS
+    const { sendRideEmail } = require("../emailService");
+
+    if (driver.email) {
+      await sendRideEmail("payoutReleased", {
+        to: driver.email,
+        driverName: driver.name,
+        amount: booking.finalPrice,
+        from: ride.from,
+        toLocation: ride.to,
+        date: ride.date,
+        time: ride.time,
+      });
+    }
+
+    if (booking.customerId?.email) {
+      await sendRideEmail("rideCompleted", {
+        to: booking.customerId.email,
+        customerName: booking.customerId.name,
+        driverName: driver.name,
+        from: ride.from,
+        toLocation: ride.to,
+        date: ride.date,
+        time: ride.time,
+      });
+    }
+
+    res.json({
+      success: true,
+      booking,
+      stripeCapture: captured,
+      stripeTransfer: transfer,
+    });
   } catch (err) {
-    console.error("❌ Release error:", err);
+    console.error("❌ Release funds error:", err);
     res.status(500).json({ error: "Could not release payment" });
   }
 });
 
-// GET /api/ridepayment/check-booking
+// =====================================================
+// ✅ Step 5: Check if customer already has a booking on this ride
+// =====================================================
 router.get("/check-booking", async (req, res) => {
   try {
     const { rideId, customerId } = req.query;
 
     if (!rideId || !customerId) {
-      return res.status(400).json({ error: "rideId and customerId are required" });
+      return res.status(400).json({
+        error: "rideId and customerId are required",
+      });
     }
 
-    const booking = await BookingRequest.findOne({ rideId, customerId });
+    // We only care about ACTIVE bookings
+    const booking = await BookingRequest.findOne({
+      rideId,
+      customerId,
+      requestStatus: { $in: ["pending", "accepted", "paid", "active"] },
+    })
+      .populate("rideId", "from to date time pricePerSeat status")
+      .populate("customerId", "name email profilePhotoUrl")
+      .lean();
 
     if (!booking) {
-      return res.status(404).json(null); // no booking yet
+      return res.json({ exists: false, booking: null });
     }
 
-    res.json(booking);
+    // Return a SAFE booking object (no Stripe fields)
+    return res.json({
+      exists: true,
+      booking: {
+        bookingId: booking._id,
+        rideId: booking.rideId?._id,
+        from: booking.from,
+        to: booking.to,
+        pricePerSeat: booking.pricePerSeat || booking.finalPrice,
+        seatsRequested: booking.seatsRequested || 1,
+        message: booking.message || "",
+        requestStatus: booking.requestStatus,
+        driverComplete: booking.driverComplete || false,
+        customerComplete: booking.customerComplete || false,
+        createdAt: booking.createdAt,
+      },
+    });
+
   } catch (err) {
-    console.error("❌ Error in check-booking:", err.message);
-    res.status(500).json({ error: "Server error" });
+    console.error("❌ Error in check-booking:", err);
+    return res.status(500).json({ error: "Server error" });
   }
 });
 
 
 // =====================================================
-// ✅ Admin refund
+// ✅ Step 6: Admin Refund (manual override)
 // =====================================================
 router.post("/rides/:bookingId/refund", async (req, res) => {
   try {
-    const booking = await BookingRequest.findById(req.params.bookingId);
-    if (!booking) return res.status(404).json({ error: "Booking not found" });
+    const bookingId = req.params.bookingId;
 
-    const refund = await stripe.refunds.create({
+    // Fetch booking with rider + ride info
+    const booking = await BookingRequest.findById(bookingId)
+      .populate("customerId", "name email")
+      .populate("rideId")
+      .exec();
+
+    if (!booking) {
+      return res.status(404).json({ error: "Booking not found" });
+    }
+
+    const ride = await Ride.findById(booking.rideId)
+      .populate("workerId", "name email")
+      .exec();
+
+    if (!ride) {
+      return res.status(404).json({ error: "Ride not found" });
+    }
+
+    // ❌ prevent duplicate refund
+    if (booking.requestStatus === "refunded") {
+      return res.status(400).json({ error: "Booking already refunded" });
+    }
+
+    if (!booking.paymentIntentId) {
+      return res.status(400).json({
+        error: "No paymentIntent found — cannot refund.",
+      });
+    }
+
+    // 💳 Stripe refund
+    const stripeRefund = await stripe.refunds.create({
       payment_intent: booking.paymentIntentId,
     });
 
-    booking.status = "rejected";
-    booking.escrowStatus = "refunded";
+    // Update booking
+    booking.requestStatus = "refunded";
+    booking.refundedAt = new Date();
+    booking.driverPaid = false; // ensure payout can't occur
     await booking.save();
 
-    res.json({ success: true, booking, stripeRefund: refund });
+    // Check if all bookings are done → cancel ride automatically
+    const remaining = await BookingRequest.countDocuments({
+      rideId: ride._id,
+      requestStatus: { $nin: ["refunded", "cancelled_by_driver"] },
+    });
+
+    if (remaining === 0) {
+      ride.status = "cancelled";
+      await ride.save();
+    }
+
+    const io = req.app.get("socketio");
+    const { sendRideEmail } = require("../emailService");
+
+    // SOCKET → notify customer
+    io.to(`ride_customer_${booking.customerId._id}`).emit("booking:refunded", {
+      bookingId,
+      rideId: ride._id,
+      message: "Your booking was refunded by an administrator.",
+    });
+
+    // SOCKET → notify driver
+    io.to(`ride_driver_${ride.workerId._id}`).emit("booking:refunded:driver", {
+      bookingId,
+      rideId: ride._id,
+      message: "A booking for your ride was refunded by admin.",
+    });
+
+    // EMAIL TO CUSTOMER
+    if (booking.customerId?.email) {
+      await sendRideEmail("rideRefunded", {
+        to: booking.customerId.email,
+        customerName: booking.customerId.name,
+        from: ride.from,
+        toLocation: ride.to,
+        date: ride.date,
+        time: ride.time,
+      });
+    }
+
+    // EMAIL TO DRIVER
+    if (ride.workerId?.email) {
+      await sendRideEmail("adminRefundDriverNotice", {
+        to: ride.workerId.email,
+        driverName: ride.workerId.name,
+        customerName: booking.customerId.name,
+        from: ride.from,
+        toLocation: ride.to,
+        date: ride.date,
+        time: ride.time,
+      });
+    }
+
+    return res.json({
+      success: true,
+      booking,
+      stripeRefund,
+    });
+
   } catch (err) {
-    console.error("❌ Refund error:", err);
-    res.status(500).json({ error: "Refund failed" });
+    console.error("❌ Admin refund error:", err);
+    return res.status(500).json({ error: "Refund failed" });
   }
 });
 
 // =====================================================
-// ✅ DRIVER ACCEPTS RIDE → Capture Payment + Notify Both
+// ✅ DRIVER ACCEPTS BOOKING (requestStatus = accepted)
+//    (NO payment capture here — PI stays on hold)
 // =====================================================
 router.post("/approve-request", async (req, res) => {
-  const { requestId } = req.body;
-  const io = getIO();
-
   try {
+    const { requestId } = req.body;
+    const io = req.app.get("socketio");
+
     const booking = await BookingRequest.findById(requestId)
       .populate({
         path: "rideId",
-        populate: { path: "workerId", select: "name email" },
+        populate: { path: "workerId", select: "name email" }
       })
       .populate("customerId", "name email");
 
-    if (!booking)
+    if (!booking) {
       return res.status(404).json({ error: "Booking not found" });
+    }
 
-    booking.status = "accepted";
+    // Prevent double acceptance
+    if (booking.requestStatus !== "pending") {
+      return res.status(400).json({ error: "Booking already processed" });
+    }
+
+    // UPDATE BOOKING
+    booking.requestStatus = "accepted";
+    booking.acceptedAt = new Date();
     await booking.save();
 
-    // ✅ Capture the payment once driver accepts
-    if (booking.paymentIntentId) {
-      try {
-        const capture = await stripe.paymentIntents.capture(
-          booking.paymentIntentId
-        );
-        console.log(`💳 Captured ride payment: ${capture.id}`);
-
-        booking.escrowStatus = "captured";
-        booking.capturedAt = new Date();
-        await booking.save();
-      } catch (err) {
-        console.error("❌ Payment capture failed:", err.message);
-      }
-    }
-
     const customer = booking.customerId;
-    const driver = booking.rideId?.workerId;
+    const driver = booking.rideId.workerId;
     const ride = booking.rideId;
 
-    // =====================================================
-    // 🔔 SOCKET NOTIFICATIONS
-    // =====================================================
-    io.to(`customer_${customer._id}`).emit("ride:update", {
-      message: "🚗 Your ride has been accepted!",
+    // SOCKETS → notify both sides
+    io.to(`ride_customer_${customer._id}`).emit("booking:accepted", {
+      bookingId: booking._id,
       rideId: ride._id,
-      status: "accepted",
+      driverName: driver.name,
+      message: "Your ride request has been accepted."
     });
 
-    io.to(`worker_${driver?._id}`).emit("ride:update", {
-      message: "✅ You accepted a ride. Payment captured successfully!",
+    io.to(`ride_driver_${driver._id}`).emit("booking:accepted:driver", {
+      bookingId: booking._id,
       rideId: ride._id,
-      status: "accepted",
+      message: "You accepted a booking request."
     });
 
-    // =====================================================
-    // ✉️ EMAIL NOTIFICATIONS
-    // =====================================================
+    // EMAILS → both sides
+    const { sendRideEmail } = require("../emailService");
 
-    // Customer email
-    if (customer?.email) {
-      await sendEmailSafe({
+    if (customer.email) {
+      await sendRideEmail("bookingAcceptedCustomer", {
         to: customer.email,
-        subject: "🚗 Your Ride Has Been Accepted!",
-        html: `
-          <h2>Hi ${customer.name || "there"},</h2>
-          <p>Your ride request from <b>${ride.from}</b> to <b>${ride.to}</b> has been <b>accepted</b> by a driver.</p>
-          <p>Your payment has been securely captured and is being held until the ride is completed.</p>
-          <p><strong>Ride Details:</strong></p>
-          <ul>
-            <li>Date: ${ride.date || "TBD"}</li>
-            <li>Time: ${ride.time || "TBD"}</li>
-            <li>Driver: ${driver?.name || "Assigned Driver"}</li>
-          </ul>
-          <p>Thank you for using <b>Book Your Need</b>. You’re all set!</p>
-          <br>
-          <p>— The Book Your Need Team</p>
-        `,
+        customerName: customer.name,
+        driverName: driver.name,
+        from: ride.from,
+        toLocation: ride.to,
+        date: ride.date,
+        time: ride.time,
       });
     }
 
-    // Driver email
-    if (driver?.email) {
-      await sendEmailSafe({
+    if (driver.email) {
+      await sendRideEmail("bookingAcceptedDriver", {
         to: driver.email,
-        subject: "✅ Ride Accepted – Payment Captured",
-        html: `
-          <h2>Hi ${driver.name || "Driver"},</h2>
-          <p>You’ve accepted a ride from <b>${ride.from}</b> to <b>${ride.to}</b>.</p>
-          <p>The customer's payment has been <b>successfully captured</b> and is now held securely until the ride is completed.</p>
-          <p>Once the customer marks the ride as complete, your earnings (minus platform fees) will be released to your wallet.</p>
-          <p>Thank you for keeping BYN customers moving safely!</p>
-          <br>
-          <p>— The Book Your Need Team</p>
-        `,
+        driverName: driver.name,
+        customerName: customer.name,
+        from: ride.from,
+        toLocation: ride.to,
+        date: ride.date,
+        time: ride.time,
       });
     }
 
-    // =====================================================
-    // ✅ FINAL RESPONSE
-    // =====================================================
-    res.json({
+    return res.json({
       success: true,
-      message: "Ride accepted, payment captured, and emails sent.",
+      message: "Booking accepted successfully.",
+      bookingId: booking._id,
     });
+
   } catch (err) {
     console.error("❌ Approve-request error:", err);
-    res.status(500).json({ error: "Failed to approve booking." });
+    res.status(500).json({ error: "Failed to approve booking" });
   }
 });
 
 // =====================================================
-// ✅ Decline request → refund customer & lock request
+// ✅ DRIVER DECLINES BOOKING → Refund + Notify
 // =====================================================
 router.post("/decline-request", async (req, res) => {
   try {
     const { requestId } = req.body;
     const io = req.app.get("socketio");
 
-    const request = await BookingRequest.findById(requestId)
-      .populate("rideId")
+    const booking = await BookingRequest.findById(requestId)
       .populate("customerId", "name email")
-      .lean();
+      .populate({
+        path: "rideId",
+        populate: { path: "workerId", select: "name email" }
+      });
 
-    if (!request) return res.status(404).json({ error: "Request not found" });
-    if (request.status !== "pending")
-      return res.status(400).json({ error: "Request is not pending" });
-
-    // ✅ Refund logic (mocked)
-    if (request.paymentIntentId) {
-      console.log(`💳 Refunded payment for ${request.paymentIntentId}`);
+    if (!booking) {
+      return res.status(404).json({ error: "Booking not found" });
     }
 
-    // ✅ Update to declined/refunded
-    await BookingRequest.findByIdAndUpdate(requestId, {
-      $set: {
-        status: "declined",
-        rideStatus: "cancelled",
-        escrowStatus: "refunded",
-        updatedAt: new Date(),
-      },
+    if (booking.requestStatus !== "pending") {
+      return res.status(400).json({ error: "Only pending bookings can be declined." });
+    }
+
+    const ride = booking.rideId;
+    const customer = booking.customerId;
+    const driver = ride.workerId;
+
+    // 💳 Process refund if payment intent exists
+    let stripeRefund = null;
+    if (booking.paymentIntentId) {
+      try {
+        stripeRefund = await stripe.refunds.create({
+          payment_intent: booking.paymentIntentId,
+        });
+      } catch (err) {
+        console.error("❌ Refund failed:", err.message);
+      }
+    }
+
+    // UPDATE BOOKING
+    booking.requestStatus = "declined";
+    booking.refundedAt = new Date();
+    booking.driverPaid = false;
+    await booking.save();
+
+    // SOCKET → customer
+    io.to(`ride_customer_${customer._id}`).emit("booking:declined", {
+      bookingId: booking._id,
+      rideId: ride._id,
+      refunded: !!stripeRefund,
+      message: "Your booking was declined by the driver."
     });
 
-    const ride = await Ride.findById(request.rideId).populate("workerId", "name email");
-
-    // --- SOCKET NOTIFICATIONS ---
-    const payload = {
-      requestId,
-      rideId: request.rideId,
-      customerName: request.customerId.name,
-      driverName: ride.workerId.name,
-      from: ride.from,
-      to: ride.to,
-      status: "declined",
-    };
-
-    io.to(`ride_customer_${request.customerId._id}`).emit("ride-declined", payload);
-    io.to(`ride_driver_${ride.workerId._id}`).emit("ride-declined:driver", payload);
-    io.to(`ride_${request.rideId}`).emit("ride-update", payload);
-
-    // --- EMAIL NOTIFICATIONS ---
-    await sendEmailSafe({
-      to: request.customerId.email,
-      subject: "🚗 Ride Declined & Refunded",
-      html: `
-        <h2>Hi ${request.customerId.name},</h2>
-        <p>Your ride from <b>${ride.from}</b> to <b>${ride.to}</b> was declined.</p>
-        <p>Your refund has been processed successfully.</p>
-        <br><p>— Book Your Need</p>
-      `,
+    // SOCKET → driver
+    io.to(`ride_driver_${driver._id}`).emit("booking:declined:driver", {
+      bookingId: booking._id,
+      rideId: ride._id,
+      message: "You declined the booking."
     });
 
-    await sendEmailSafe({
-      to: ride.workerId.email,
-      subject: "⚠️ Ride Declined Confirmation",
-      html: `
-        <h2>Hi ${ride.workerId.name},</h2>
-        <p>The ride from <b>${ride.from}</b> to <b>${ride.to}</b> was declined.</p>
-        <br><p>— Book Your Need</p>
-      `,
-    });
+    // EMAILS
+    const { sendRideEmail } = require("../emailService");
 
-    res.json({
+    if (customer.email) {
+      await sendRideEmail("bookingDeclinedCustomer", {
+        to: customer.email,
+        customerName: customer.name,
+        driverName: driver.name,
+        from: ride.from,
+        toLocation: ride.to,
+        date: ride.date,
+        time: ride.time,
+        refunded: !!stripeRefund,
+      });
+    }
+
+    if (driver.email) {
+      await sendRideEmail("bookingDeclinedDriver", {
+        to: driver.email,
+        driverName: driver.name,
+        customerName: customer.name,
+        from: ride.from,
+        toLocation: ride.to,
+        date: ride.date,
+        time: ride.time,
+      });
+    }
+
+    return res.json({
       success: true,
-      message: "Request declined & refunded.",
+      message: "Booking declined and refund processed.",
+      refunded: !!stripeRefund,
     });
+
   } catch (err) {
     console.error("❌ Decline request error:", err);
-    res.status(500).json({ error: "Failed to decline request" });
+    res.status(500).json({ error: "Failed to decline booking" });
   }
 });
 
 // =====================================================
-// ✅ Worker Marks Ride Complete → Start 48h Escrow Timer
+// ✅ DRIVER MARKS BOOKING COMPLETE (new booking-based system)
 // =====================================================
 router.post("/worker-complete", async (req, res) => {
   try {
-    const { rideId, workerId } = req.body;
+    const { bookingId, workerId } = req.body;
     const io = req.app.get("socketio");
+    const { sendRideEmail } = require("../emailService");
 
-    // 🧩 1️⃣ Find the booking for this ride
-console.log("🔍 Looking for booking with rideId:", rideId, "and workerId:", workerId);
+    if (!bookingId || !workerId) {
+      return res.status(400).json({ error: "bookingId and workerId are required" });
+    }
 
-const booking = await BookingRequest.findOne({
-  rideId,
-  $or: [
-    { rideStatus: "accepted" },
-    { rideStatus: "active" },
-    { status: "accepted" },
-    { status: "active" }
-  ],
-})
-  .populate("customerId", "name email")
-  .populate("rideId")
-  .lean();
+    // Fetch booking with ride + rider
+    const booking = await BookingRequest.findById(bookingId)
+      .populate("customerId", "name email")
+      .populate({
+        path: "rideId",
+        populate: { path: "workerId", select: "name email" }
+      });
 
-if (!booking) {
-  console.warn("⚠️ No booking found matching rideId and status for worker:", workerId);
-  return res.status(404).json({ error: "Booking not found or not accepted yet" });
-}
+    if (!booking) {
+      return res.status(404).json({ error: "Booking not found" });
+    }
 
-console.log("✅ Found booking:", {
-  bookingId: booking._id,
-  rideStatus: booking.rideStatus,
-  status: booking.status,
-  customer: booking.customerId?.email,
-});
+    // Ensure the driver owns this booking (security)
+    if (String(booking.rideId.workerId._id) !== String(workerId)) {
+      return res.status(403).json({ error: "Unauthorized – driver mismatch" });
+    }
 
+    // Prevent double-complete
+    if (booking.driverComplete) {
+      return res.json({ success: true, message: "Driver already marked complete." });
+    }
 
-    if (!booking)
-      return res.status(404).json({ error: "Booking not found or not accepted yet" });
+    // Mark booking complete by driver
+    booking.driverComplete = true;
+    booking.driverCompletedAt = new Date();
+    await booking.save();
 
-    await BookingRequest.findByIdAndUpdate(booking._id, {
-      rideStatus: "worker_completed",
-      escrowStatus: "pending_release",
-      workerCompletedAt: new Date(),
-      releaseDate: new Date(Date.now() + 48 * 60 * 60 * 1000),
+    const ride = booking.rideId;
+    const customer = booking.customerId;
+    const driver = ride.workerId;
+
+    // SOCKET → notify customer
+    io.to(`ride_customer_${customer._id}`).emit("booking:driverComplete", {
+      bookingId,
+      rideId: ride._id,
+      message: `Your driver ${driver.name} marked this ride as complete. Please confirm.`,
     });
 
-    const ride = await Ride.findByIdAndUpdate(
-      rideId,
-      { status: "worker_completed", updatedAt: new Date() },
-      { new: true }
-    ).populate("workerId", "name email");
+    // SOCKET → notify driver
+    io.to(`ride_driver_${driver._id}`).emit("booking:driverComplete:driver", {
+      bookingId,
+      rideId: ride._id,
+      message: "You marked this booking as complete.",
+    });
 
-    const payload = {
-      rideId,
-      bookingId: booking._id,
-      customerId: booking.customerId._id,
-      driverId: ride.workerId._id,
-      from: ride.from,
-      to: ride.to,
-      date: ride.date,
-      time: ride.time,
-      status: "worker_completed",
-      message: "Driver marked ride complete. Awaiting your confirmation.",
-    };
-
-    io.to(`ride_customer_${booking.customerId._id}`).emit("ride-worker-completed", payload);
-    io.to(`ride_driver_${ride.workerId._id}`).emit("ride-worker-completed:driver", payload);
-    io.to(`ride_${rideId}`).emit("ride-update", payload);
-
-    if (booking.customerId?.email) {
-      await sendEmailSafe({
-        to: booking.customerId.email,
-        subject: "🚗 Driver Marked Ride Complete",
-        html: `
-          <h2>Hi ${booking.customerId.name || "Customer"},</h2>
-          <p>Your driver <b>${ride.workerId.name}</b> marked your ride from <b>${ride.from}</b> to <b>${ride.to}</b> as complete.</p>
-          <p>Please confirm or payment will auto-release in 48 hours.</p>
-          <br><p>— Book Your Need</p>
-        `,
+    // EMAIL → notify customer
+    if (customer.email) {
+      await sendRideEmail("driverMarkedComplete", {
+        to: customer.email,
+        customerName: customer.name,
+        driverName: driver.name,
+        from: ride.from,
+        toLocation: ride.to,
+        date: ride.date,
+        time: ride.time,
       });
     }
 
     res.json({
       success: true,
-      message: "Ride marked complete. Awaiting customer confirmation or auto-release.",
+      message: "Booking marked complete by driver. Awaiting customer confirmation.",
     });
+
   } catch (err) {
     console.error("❌ Worker complete error:", err);
     res.status(500).json({ error: "Failed to mark ride complete" });
@@ -602,369 +857,464 @@ console.log("✅ Found booking:", {
 });
 
 // =====================================================
-// ✅ Customer Completes Ride → Stripe payout + Wallet credit + Earnings update
+// ✅ CUSTOMER MARKS BOOKING COMPLETE (new booking-based system)
 // =====================================================
 router.post("/customer-complete", async (req, res) => {
-  const { rideId } = req.body;
-  const io = req.app.get("socketio");
-
   try {
-    console.log("🚗 [CUSTOMER-COMPLETE] Incoming rideId:", rideId);
+    const { bookingId, customerId } = req.body;
+    const io = req.app.get("socketio");
+    const { sendRideEmail } = require("../emailService");
 
-    // 🔹 Find booking tied to this ride
-    const booking = await BookingRequest.findOne({ rideId })
-      .populate("rideId")
-      .populate("customerId");
+    if (!bookingId || !customerId) {
+      return res.status(400).json({ error: "bookingId and customerId are required" });
+    }
+
+    // Fetch booking
+    const booking = await BookingRequest.findById(bookingId)
+      .populate("customerId", "name email")
+      .populate({
+        path: "rideId",
+        populate: { path: "workerId", select: "name email" }
+      });
 
     if (!booking) {
-      console.warn("⚠️ [CUSTOMER-COMPLETE] Booking not found for ride:", rideId);
       return res.status(404).json({ error: "Booking not found" });
     }
 
-    const ride = booking.rideId;
-    const customer = booking.customerId;
-
-    if (!ride) return res.status(400).json({ error: "Ride not found" });
-
-    // 🔹 Ensure driver exists
-    const driver = await Worker.findById(ride.workerId);
-    if (!driver) return res.status(400).json({ error: "No driver assigned" });
-
-    // 💵 Calculate payout (subtract Stripe + BYN fee)
-    const baseFare = Number(ride.price);
-    const stripeFee = 0.36; // Stripe transaction fee
-    const platformFee = 2.0; // BYN platform fee per ride
-    const finalPayout = Math.max(0, baseFare - stripeFee - platformFee);
-
-    console.log(
-      `💰 [CUSTOMER-COMPLETE] Base: ${baseFare}, Fees: ${stripeFee + platformFee}, Driver earns: ${finalPayout}`
-    );
-
-    // 💳 Create Stripe Transfer (if driver connected)
-    try {
-      if (!driver.stripeAccountId) {
-        console.warn("⚠️ Driver not connected to Stripe, skipping auto-transfer.");
-      } else {
-        const transfer = await stripe.transfers.create({
-          amount: Math.round(finalPayout * 100),
-          currency: "cad",
-          destination: driver.stripeAccountId,
-          description: `BYN Ride payout to ${driver.name}`,
-        });
-        console.log(`✅ Stripe payout completed: ${transfer.id}`);
-
-        // Update ride payout status
-        ride.stripePaymentIntentId = booking.paymentIntentId;
-        ride.paymentStatus = "paid";
-        ride.payoutStatus = "completed";
-        ride.payoutAmount = finalPayout;
-        ride.payoutDate = new Date();
-        ride.isPaidOut = true;
-        await ride.save();
-      }
-    } catch (err) {
-      console.error("❌ Stripe payout failed:", err.message);
+    // Security check: correct customer
+    if (String(booking.customerId._id) !== String(customerId)) {
+      return res.status(403).json({ error: "Unauthorized – customer mismatch" });
     }
 
-    // 💼 Credit driver's wallet + total earnings
-    driver.walletBalance = (driver.walletBalance || 0) + finalPayout;
-    driver.totalEarnings = (driver.totalEarnings || 0) + finalPayout;
+    // Prevent duplicate marking
+    if (booking.customerComplete) {
+      return res.json({ success: true, message: "Customer already marked complete." });
+    }
 
-    driver.walletHistory.push({
-      type: "credit",
-      amount: finalPayout,
-      rideId: ride._id,
-      date: new Date(),
-      released: true,
-      notes: `Ride payout (after $${(stripeFee + platformFee).toFixed(2)} fees)`,
-    });
-
-    await driver.save();
-
-    // ✅ Mark booking & ride complete
-    booking.status = "completed";
-    booking.escrowStatus = "released";
-    booking.rideStatus = "completed";
+    // Mark booking complete by customer
+    booking.customerComplete = true;
+    booking.customerCompletedAt = new Date();
     await booking.save();
 
-    ride.status = "completed";
-    await ride.save();
+    const ride = booking.rideId;
+    const customer = booking.customerId;
+    const driver = ride.workerId;
 
-    console.log(
-      "📦 [CUSTOMER-COMPLETE] Booking + Ride updated to completed + wallet credited + total earnings updated."
-    );
-
-    // 🔔 Real-time socket notifications
-    io.to(`worker_${driver._id}`).emit("ride:update", {
+    // SOCKET → notify driver
+    io.to(`ride_driver_${driver._id}`).emit("booking:customerComplete", {
+      bookingId,
       rideId: ride._id,
-      status: "completed",
-      message: `🎉 Ride completed. $${finalPayout} released to your wallet.`,
+      message: `Customer ${customer.name} marked the booking as complete.`,
     });
 
-    io.to(`customer_${customer._id}`).emit("ride:update", {
+    // SOCKET → notify customer
+    io.to(`ride_customer_${customer._id}`).emit("booking:customerComplete:customer", {
+      bookingId,
       rideId: ride._id,
-      status: "completed",
-      message: "✅ Ride marked complete and driver paid.",
+      message: "You marked the ride as complete.",
     });
 
-    // ✉️ Notify driver via email
-    await sendEmailSafe({
-      to: driver.email,
-      subject: "💰 Ride Payment Released",
-      html: `
-        <h2>Hi ${driver.name},</h2>
-        <p>Your ride <b>${ride.from} → ${ride.to}</b> has been completed.</p>
-        <p>You earned <b>$${finalPayout.toFixed(2)}</b> (after fees).</p>
-        <p>Funds have been added to your BYN wallet and sent to your Stripe account if connected.</p>
-        <br><p>— Book Your Need Team</p>
-      `,
-    });
+    // EMAIL → driver
+    if (driver.email) {
+      await sendRideEmail("customerMarkedComplete", {
+        to: driver.email,
+        driverName: driver.name,
+        customerName: customer.name,
+        from: ride.from,
+        toLocation: ride.to,
+        date: ride.date,
+        time: ride.time,
+      });
+    }
 
-    // ✉️ Notify customer
-    await sendEmailSafe({
-      to: customer.email,
-      subject: "✅ Ride Completed",
-      html: `
-        <h2>Hi ${customer.name || "Customer"},</h2>
-        <p>Your ride <b>${ride.from} → ${ride.to}</b> has been completed successfully.</p>
-        <p>Thanks for using <b>Book Your Need</b> 🚗</p>
-      `,
-    });
+    // If BOTH completed → booking is ready for payout
+    let readyForPayout = false;
 
-    console.log("📧 [CUSTOMER-COMPLETE] Emails sent to both driver and customer.");
+    if (booking.driverComplete && booking.customerComplete) {
+      readyForPayout = true;
 
-    // ✅ Final Response
-    res.json({
+      io.to(`ride_driver_${driver._id}`).emit("booking:readyForPayout", {
+        bookingId,
+        rideId: ride._id,
+        message: "Booking completed by both sides. Awaiting admin release.",
+      });
+
+      io.to(`ride_customer_${customer._id}`).emit("booking:readyForPayout", {
+        bookingId,
+        rideId: ride._id,
+        message: "Ride fully completed. Admin will release payment soon.",
+      });
+    }
+
+    return res.json({
       success: true,
-      message: `Ride completed. Driver earned $${finalPayout}.`,
+      message: "Customer marked booking complete.",
+      readyForPayout,
     });
+
   } catch (err) {
-    console.error("❌ [CUSTOMER-COMPLETE] Error:", err);
-    res.status(500).json({ error: "Failed to complete ride." });
+    console.error("❌ Customer complete error:", err);
+    return res.status(500).json({ error: "Failed to complete booking" });
   }
 });
 
-
-// ⚠️ Step 4: Dispute Ride → Hold Payment
+// =====================================================
+// ✅ Step 4: Raise Dispute on Booking (new booking-based system)
 // =====================================================
 router.post("/dispute", async (req, res) => {
   try {
-    const { bookingId, reason, raisedBy } = req.body; // raisedBy = 'customer' or 'worker'
-
-    const booking = await BookingRequest.findById(bookingId);
-    if (!booking) return res.status(404).json({ error: "Booking not found" });
-
-    booking.rideStatus = "dispute_pending";
-    booking.escrowStatus = "disputed";
-    booking.status = "disputed";
-    await booking.save();
-
-    // (optional) Email admin@bookyourneed.com
-    console.log(`🚨 Dispute raised by ${raisedBy} for booking ${bookingId}: ${reason}`);
-
-    res.json({
-      success: true,
-      message: "Dispute raised successfully. Payment is on hold until admin review.",
-      booking,
-    });
-  } catch (err) {
-    console.error("❌ Dispute error:", err);
-    res.status(500).json({ error: "Failed to raise dispute" });
-  }
-});
-
-// =====================================================
-// ✅ AUTO-COMPLETE RIDES (after timeout) → Auto-payout + wallet credit
-// =====================================================
-router.post("/auto-complete", async (req, res) => {
-  try {
-    const { rideId } = req.body;
+    const { bookingId, reason, raisedBy } = req.body;
     const io = req.app.get("socketio");
+    const { sendRideEmail } = require("../emailService");
 
-    console.log("🕒 [AUTO-COMPLETE] Running for ride:", rideId);
+    if (!bookingId || !reason || !raisedBy) {
+      return res.status(400).json({
+        error: "bookingId, reason, and raisedBy are required",
+      });
+    }
 
-    // Fetch booking and populate required fields
-    const booking = await BookingRequest.findOne({ rideId })
-      .populate("rideId")
-      .populate("customerId");
+    const booking = await BookingRequest.findById(bookingId)
+      .populate("customerId", "name email")
+      .populate({
+        path: "rideId",
+        populate: { path: "workerId", select: "name email" },
+      });
 
     if (!booking) {
-      console.warn("⚠️ [AUTO-COMPLETE] No booking found for ride:", rideId);
       return res.status(404).json({ error: "Booking not found" });
     }
 
     const ride = booking.rideId;
     const customer = booking.customerId;
-    const driver = await Worker.findById(ride.workerId);
+    const driver = ride.workerId;
 
-    if (!driver) {
-      console.error("❌ [AUTO-COMPLETE] No driver found for ride:", rideId);
-      return res.status(400).json({ error: "Driver not found" });
+    // 🔐 Prevent double disputes
+    if (booking.requestStatus === "disputed") {
+      return res.json({
+        success: true,
+        message: "A dispute for this booking already exists.",
+      });
     }
 
-    // 💵 Calculate payout (same as manual)
-    const baseFare = Number(ride.price);
+    // Update booking
+    booking.requestStatus = "disputed";
+    booking.disputedBy = raisedBy;                 // "customer" | "worker"
+    booking.disputeReason = reason;
+    booking.disputedAt = new Date();
+    await booking.save();
+
+    // 🔔 SOCKET NOTIFICATIONS
+    io.to(`ride_customer_${customer._id}`).emit("booking:disputed", {
+      bookingId,
+      rideId: ride._id,
+      raisedBy,
+      reason,
+      message: "A dispute has been filed for this booking.",
+    });
+
+    io.to(`ride_driver_${driver._id}`).emit("booking:disputed:driver", {
+      bookingId,
+      rideId: ride._id,
+      raisedBy,
+      reason,
+      message: "A dispute has been raised on this booking.",
+    });
+
+    // ✉️ EMAIL — notify customer/driver
+    if (raisedBy === "customer" && driver.email) {
+      await sendRideEmail("customerRaisedDispute", {
+        to: driver.email,
+        driverName: driver.name,
+        customerName: customer.name,
+        reason,
+        from: ride.from,
+        toLocation: ride.to,
+        date: ride.date,
+        time: ride.time,
+      });
+    }
+
+    if (raisedBy === "worker" && customer.email) {
+      await sendRideEmail("driverRaisedDispute", {
+        to: customer.email,
+        customerName: customer.name,
+        driverName: driver.name,
+        reason,
+        from: ride.from,
+        toLocation: ride.to,
+        date: ride.date,
+        time: ride.time,
+      });
+    }
+
+    // 📧 Email admin
+    if (process.env.ADMIN_EMAIL) {
+      await sendRideEmail("adminDisputeNotice", {
+        to: process.env.ADMIN_EMAIL,
+        customerName: customer.name,
+        driverName: driver.name,
+        reason,
+        from: ride.from,
+        toLocation: ride.to,
+        bookingId,
+      });
+    } else {
+      console.log(
+        `📨 Admin email missing. Dispute logged for booking ${bookingId}: ${reason}`
+      );
+    }
+
+    return res.json({
+      success: true,
+      message: "Dispute raised successfully. Admin will review this case.",
+    });
+
+  } catch (err) {
+    console.error("❌ Dispute error:", err);
+    return res.status(500).json({ error: "Failed to raise dispute" });
+  }
+});
+
+// =====================================================
+// ✅ AUTO-COMPLETE + AUTO-PAYOUT + WALLET CREDIT (48h)
+// =====================================================
+router.post("/auto-complete", async (req, res) => {
+  try {
+    const { bookingId } = req.body;
+    const io = req.app.get("socketio");
+    const { sendRideEmail } = require("../emailService");
+
+    if (!bookingId) {
+      return res.status(400).json({ error: "bookingId is required" });
+    }
+
+    // Fetch booking fully
+    const booking = await BookingRequest.findById(bookingId)
+      .populate("customerId", "name email")
+      .populate({
+        path: "rideId",
+        populate: { path: "workerId", select: "name email stripeAccountId walletBalance walletHistory" }
+      });
+
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+    const ride = booking.rideId;
+    const customer = booking.customerId;
+    const driver = ride.workerId;
+
+    // ❌ Block if dispute exists
+    if (booking.requestStatus === "disputed") {
+      return res.json({
+        success: false,
+        message: "Booking has a dispute — auto-complete blocked.",
+      });
+    }
+
+    // ❌ Only auto-complete if driver marked done
+    if (!booking.driverComplete || booking.customerComplete) {
+      return res.json({
+        success: false,
+        message: "Booking not eligible for auto-complete.",
+      });
+    }
+
+    // STEP 1 — Mark customer side complete
+    booking.customerComplete = true;
+    booking.customerCompletedAt = new Date();
+    await booking.save();
+
+    // STEP 2 — Calculate payout
+    const baseFare = Number(booking.finalPrice || ride.price); 
     const stripeFee = 0.36;
-    const platformFee = 2;
+    const platformFee = 2.0;
     const finalPayout = Math.max(0, baseFare - stripeFee - platformFee);
 
-    console.log(
-      `💰 [AUTO-COMPLETE] Auto-paying driver $${finalPayout.toFixed(
-        2
-      )} (Base $${baseFare} - Fees $${(stripeFee + platformFee).toFixed(2)})`
-    );
+    let stripeCapture = null;
+    let stripeTransfer = null;
 
-    // 💳 Try Stripe transfer if driver connected
+    // STEP 3 — Capture + Payout
     try {
+      if (!booking.paymentIntentId) {
+        throw new Error("Missing paymentIntentId, cannot auto-capture.");
+      }
+
+      // Capture payment
+      stripeCapture = await stripe.paymentIntents.capture(booking.paymentIntentId);
+
+      // Stripe transfer (optional)
       if (driver.stripeAccountId) {
-        const transfer = await stripe.transfers.create({
+        stripeTransfer = await stripe.transfers.create({
           amount: Math.round(finalPayout * 100),
           currency: "cad",
           destination: driver.stripeAccountId,
-          description: `BYN Auto-Payout to ${driver.name}`,
+          description: `BYN auto-payout for booking ${booking._id}`,
         });
-
-        console.log(`✅ [AUTO-COMPLETE] Stripe payout sent: ${transfer.id}`);
-
-        ride.stripePaymentIntentId = booking.paymentIntentId;
-        ride.paymentStatus = "paid";
-        ride.payoutStatus = "completed";
-        ride.payoutAmount = finalPayout;
-        ride.payoutDate = new Date();
-        ride.isPaidOut = true;
-        await ride.save();
-      } else {
-        console.warn(
-          "⚠️ [AUTO-COMPLETE] Driver not connected to Stripe — wallet credit only."
-        );
       }
+
+      // Mark booking paid
+      booking.requestStatus = "paid";
+      booking.escrowStatus = "released";
+      booking.paidAt = new Date();
+      await booking.save();
+
     } catch (err) {
-      console.error("❌ [AUTO-COMPLETE] Stripe payout failed:", err.message);
+      console.error("❌ AUTO-PAYOUT FAILED:", err.message);
     }
 
-    // 💼 Credit wallet regardless (acts as internal ledger)
+    // STEP 4 — ALWAYS CREDIT DRIVER WALLET (internal ledger)
     driver.walletBalance = (driver.walletBalance || 0) + finalPayout;
+
     driver.walletHistory.push({
       type: "credit",
       amount: finalPayout,
+      bookingId: booking._id,
       rideId: ride._id,
-      date: new Date(),
       released: true,
-      notes: `Auto ride payout (after $${(stripeFee + platformFee).toFixed(
-        2
-      )} fees)`,
+      date: new Date(),
+      notes: `Auto-complete payout (after $${(stripeFee + platformFee).toFixed(2)} fees)`,
     });
+
     await driver.save();
 
-    // ✅ Update booking and ride
-    booking.status = "completed";
-    booking.escrowStatus = "released";
-    booking.rideStatus = "completed";
-    await booking.save();
-
-    ride.status = "completed";
-    await ride.save();
-
-    console.log("📦 [AUTO-COMPLETE] Ride and booking marked as completed.");
-
-    // 🔔 Notify both via socket
-    io.to(`worker_${driver._id}`).emit("ride:update", {
+    // STEP 5 — If all bookings for ride are paid, mark ride completed
+    const remaining = await BookingRequest.countDocuments({
       rideId: ride._id,
-      status: "completed",
-      message: `✅ Ride auto-completed. $${finalPayout} released to your wallet.`,
+      requestStatus: { $nin: ["paid"] },
     });
 
-    io.to(`customer_${customer._id}`).emit("ride:update", {
+    if (remaining === 0) {
+      ride.status = "completed";
+      await ride.save();
+    }
+
+    // STEP 6 — SOCKET notifications
+    io.to(`ride_customer_${customer._id}`).emit("booking:autoPaid", {
+      bookingId,
       rideId: ride._id,
-      status: "completed",
-      message: "✅ Ride auto-completed and driver paid.",
+      message: "Your booking was auto-completed after 48 hours.",
+      payout: finalPayout,
     });
 
-    // ✉️ Emails
-    await sendEmailSafe({
-      to: driver.email,
-      subject: "💸 Ride Auto-Completed & Payment Released",
-      html: `
-        <h2>Hi ${driver.name},</h2>
-        <p>Your ride <b>${ride.from} → ${ride.to}</b> was automatically marked as completed.</p>
-        <p>You earned <b>$${finalPayout.toFixed(
-          2
-        )}</b> (after fees), credited to your wallet and sent to your Stripe account if connected.</p>
-        <p>Transfer Type: Auto-Complete</p>
-        <br><p>— Book Your Need</p>
-      `,
+    io.to(`ride_driver_${driver._id}`).emit("booking:autoPaid:driver", {
+      bookingId,
+      rideId: ride._id,
+      payout: finalPayout,
+      message: `Auto-payout released: $${finalPayout}.`,
     });
 
-    await sendEmailSafe({
-      to: customer.email,
-      subject: "✅ Ride Auto-Completed",
-      html: `
-        <h2>Hi ${customer.name || "Customer"},</h2>
-        <p>Your ride <b>${ride.from} → ${ride.to}</b> has been automatically completed and payment released to the driver.</p>
-        <p>If this was in error, please contact support immediately.</p>
-        <br><p>— Book Your Need</p>
-      `,
-    });
+    // STEP 7 — EMAIL notifications
+    if (customer.email) {
+      await sendRideEmail("autoCompleteCustomer", {
+        to: customer.email,
+        customerName: customer.name,
+        driverName: driver.name,
+        from: ride.from,
+        toLocation: ride.to,
+        date: ride.date,
+        time: ride.time,
+      });
+    }
 
-    console.log("📧 [AUTO-COMPLETE] Emails sent.");
+    if (driver.email) {
+      await sendRideEmail("autoPayoutDriver", {
+        to: driver.email,
+        driverName: driver.name,
+        customerName: customer.name,
+        payout: finalPayout,
+        from: ride.from,
+        toLocation: ride.to,
+        date: ride.date,
+        time: ride.time,
+      });
+    }
 
-    res.json({
+    return res.json({
       success: true,
-      message: `Ride auto-completed and driver credited $${finalPayout}.`,
+      message: `Auto-complete done. Driver earned $${finalPayout}.`,
+      autoPayout: true,
     });
+
   } catch (err) {
-    console.error("❌ [AUTO-COMPLETE] Error:", err);
-    res.status(500).json({ error: "Auto-complete failed" });
+    console.error("❌ Auto-complete error:", err);
+    return res.status(500).json({ error: "Auto-complete failed" });
   }
 });
 
 
 // =====================================================
-// 🧹 Step 6: Cleanup completed & paid rides + Admin Email
+// 🧹 Step 6: Cleanup old completed bookings (SAFE VERSION)
+//   • Does NOT delete booking
+//   • Archives ride only when all bookings done
+//   • Deletes ONLY chat threads
+//   • Leaves wallet + payouts intact
 // =====================================================
 router.post("/cleanup-completed", async (req, res) => {
   try {
-    const { sendEmailSafe } = require("../emailService");
-
-    const completed = await BookingRequest.find({
-      rideStatus: "completed",
-      escrowStatus: "released",
-    }).lean();
-
-    if (!completed.length)
-      return res.json({ success: true, message: "No completed rides to clean up" });
+    const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
+    const cutoff = Date.now() - THIRTY_DAYS;
 
     const Chat = require("../models/RideChat");
     const Ride = require("../models/Ride");
+
+    // 1️⃣ Find all fully completed & paid bookings older than 30 days
+    const bookings = await BookingRequest.find({
+      requestStatus: "paid",
+      customerComplete: true,
+      driverComplete: true,
+      paidAt: { $lte: new Date(cutoff) },
+      archived: { $ne: true },
+    });
+
+    if (!bookings.length) {
+      return res.json({
+        success: true,
+        message: "No bookings eligible for cleanup",
+      });
+    }
+
     let cleanedCount = 0;
 
-    for (const b of completed) {
+    for (const b of bookings) {
       try {
-        await Chat.deleteMany({ rideId: b.rideId });
-        await Ride.findByIdAndUpdate(b.rideId, { isArchived: true });
-        await BookingRequest.findByIdAndDelete(b._id);
+        // 2️⃣ Delete chat for this booking ONLY
+        await Chat.deleteMany({
+          rideId: b.rideId,
+          customerId: b.customerId,
+        });
+
+        // 3️⃣ Mark booking archived (do NOT delete)
+        b.archived = true;
+        await b.save();
+
         cleanedCount++;
+
+        // 4️⃣ Check if all bookings for this ride are archived → archive ride
+        const remaining = await BookingRequest.countDocuments({
+          rideId: b.rideId,
+          archived: { $ne: true },
+        });
+
+        if (remaining === 0) {
+          await Ride.findByIdAndUpdate(b.rideId, {
+            isArchived: true,
+            updatedAt: new Date(),
+          });
+        }
+
       } catch (err) {
         console.error(`❌ Cleanup failed for booking ${b._id}:`, err.message);
       }
     }
 
-    // 📧 Optional admin notification
-    await sendEmailSafe({
-      to: "admin@bookyourneed.com",
-      subject: `🧹 Cleanup Completed (${cleanedCount} rides)`,
-      html: `<p>${cleanedCount} completed & paid rides were archived successfully.</p>`,
-      context: "cleanup-completed",
+    return res.json({
+      success: true,
+      message: `Cleaned ${cleanedCount} old bookings safely.`,
+      cleaned: cleanedCount,
     });
 
-    res.json({
-      success: true,
-      message: `🧹 Cleaned up ${cleanedCount} completed rides`,
-      count: cleanedCount,
-    });
   } catch (err) {
     console.error("❌ Cleanup error:", err);
-    res.status(500).json({ error: "Failed to clean up completed rides" });
+    res.status(500).json({ error: "Cleanup failed" });
   }
 });
 
