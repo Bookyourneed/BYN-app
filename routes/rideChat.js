@@ -23,14 +23,20 @@ router.get("/participants/:workerId", async (req, res) => {
       .populate("rideId")
       .populate("customerId", "name profilePhotoUrl");
 
-    const formatted = chats.map((c) => ({
-      rideId: c.rideId?._id,
-      customerId: c.customerId?._id,
-      customerName: c.customerId?.name,
-      customerPhoto: c.customerId?.profilePhotoUrl,
-      lastMessage: c.lastMessage || "",
-      lastTimestamp: c.lastMessageAt || c.updatedAt,
-    }));
+    const formatted = chats.map((c) => {
+      const last = c.messages?.length
+        ? c.messages[c.messages.length - 1]
+        : null;
+
+      return {
+        rideId: c.rideId?._id,
+        customerId: c.customerId?._id,
+        customerName: c.customerId?.name,
+        customerPhoto: c.customerId?.profilePhotoUrl,
+        lastMessage: last?.text || "",
+        lastTimestamp: last?.timestamp || c.updatedAt,
+      };
+    });
 
     res.json(formatted);
   } catch (err) {
@@ -55,7 +61,7 @@ router.get("/:rideId", async (req, res) => {
       .populate("customerId", "name email profilePhotoUrl")
       .populate("workerId", "name email profilePhotoUrl");
 
-    // If missing → create it
+    // If missing → create
     if (!chat) {
       const ride = await Ride.findById(rideId);
       if (!ride) return res.status(404).json({ error: "Ride not found" });
@@ -77,6 +83,10 @@ router.get("/:rideId", async (req, res) => {
       rideId: chat.rideId?._id,
       customerId: chat.customerId?._id,
       workerId: chat.workerId?._id,
+      worker: {
+        name: chat.workerId?.name,
+        profilePhotoUrl: chat.workerId?.profilePhotoUrl,
+      },
       messages: chat.messages,
     });
   } catch (err) {
@@ -89,7 +99,7 @@ router.get("/:rideId", async (req, res) => {
    🟩 SEND MESSAGE (SOCKET + EMAIL)
 ====================================================== */
 
-const chatCooldown = new Map(); // 5-minute cooldown
+const chatCooldown = new Map(); // 5min cooldown
 
 router.post("/send", async (req, res) => {
   try {
@@ -103,14 +113,14 @@ router.post("/send", async (req, res) => {
     const workerId = parts[2];
 
     if (!customerId || !workerId)
-      return res.status(400).json({ error: "Invalid roomId format" });
+      return res.status(400).json({ error: "Bad roomId format" });
 
     let chat = await RideChat.findOne({ rideId, customerId })
       .populate("rideId")
       .populate("customerId", "name email profilePhotoUrl")
       .populate("workerId", "name email profilePhotoUrl");
 
-    // Create chat if missing
+    // Create if missing
     if (!chat) {
       chat = await RideChat.create({
         rideId,
@@ -125,10 +135,10 @@ router.post("/send", async (req, res) => {
         .populate("workerId", "name email profilePhotoUrl");
     }
 
-    // ⭐ MUST MATCH SCHEMA
+    // MUST MATCH SCHEMA
     const msg = {
       text,
-      sender, // <<< FIXED HERE (must be sender)
+      sender,
       senderModel,
       timestamp: new Date(),
     };
@@ -136,13 +146,20 @@ router.post("/send", async (req, res) => {
     chat.messages.push(msg);
     await chat.save();
 
-    /* Emit the message */
+    /* 🔥 Emit full payload so frontend sees driver name + photo */
     req.io.to(roomId).emit("ride-message", {
       roomId,
-      message: msg,
+      rideId,
+      customerId,
+      workerId,
+      message: {
+        ...msg,
+        driverName: chat.workerId?.name || "Driver",
+        driverPhoto: chat.workerId?.profilePhotoUrl || null,
+      },
     });
 
-    /* EMAIL NOTIFICATION — 5 MIN COOLDOWN */
+    /* EMAIL (cooldown 5 min) */
     const cooldownKey = `${rideId}-${customerId}-${senderModel}`;
     const now = Date.now();
 
@@ -174,23 +191,44 @@ router.post("/send", async (req, res) => {
 });
 
 /* ======================================================
-   🟥 CUSTOMER — list chats in “Your Trips”
+   🟥 CUSTOMER — CHATS FOR “YOUR TRIPS”
 ====================================================== */
 router.get("/my-chats/:customerId", async (req, res) => {
   try {
     const { customerId } = req.params;
 
-    const chats = await RideChat.find({ customerId }).populate({
-      path: "rideId",
-      select: "from to date time workerId",
-      populate: {
+    const chats = await RideChat.find({ customerId })
+      .populate({
         path: "workerId",
         model: "Worker",
         select: "name profilePhotoUrl",
-      },
+      })
+      .populate({
+        path: "rideId",
+        model: "Ride",
+        select: "from to date time",
+      })
+      .lean();
+
+    const formatted = chats.map((c) => {
+      const last = c.messages?.length
+        ? c.messages[c.messages.length - 1]
+        : null;
+
+      return {
+        _id: c._id,
+        rideId: c.rideId?._id,
+        worker: {
+          _id: c.workerId?._id,
+          name: c.workerId?.name || "Driver",
+          profilePhotoUrl: c.workerId?.profilePhotoUrl || null,
+        },
+        lastMessage: last?.text || "",
+        lastMessageAt: last?.timestamp || c.updatedAt,
+      };
     });
 
-    res.json(chats);
+    res.json(formatted);
   } catch (err) {
     console.error("❌ Customer chat list error:", err);
     res.status(500).json({ error: "Server error" });
