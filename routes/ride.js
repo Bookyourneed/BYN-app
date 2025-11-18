@@ -116,7 +116,7 @@ router.get("/worker/:workerId/requests", async (req, res) => {
       // Fetch latest request for the hub preview
       const req = await BookingRequest.findOne({
         rideId,
-        status: { $in: ["pending", "active", "accepted"] }
+        requestStatus: { $in: ["pending", "active", "accepted"] }
       })
         .sort({ createdAt: -1 })
         .populate("customerId", "name profilePhotoUrl")
@@ -147,7 +147,7 @@ router.get("/worker/:workerId/requests", async (req, res) => {
           date: ride.date,
           time: ride.time,
           pickupLocation: ride.pickupLocation,
-          pricePerSeat: ride.price,
+          pricePerSeat: ride.pricePerSeat,
           stops: ride.stops,
 
           timestamp: req.createdAt
@@ -253,7 +253,7 @@ router.get("/preview/:rideId", async (req, res) => {
 
     let matchedFrom = ride.from;
     let matchedTo = ride.to;
-    let finalPrice = ride.price;
+    let finalPrice = ride.pricePerSeat;;
 
     if (ride.stops?.length && (from || to)) {
       let fromStop = null;
@@ -355,7 +355,7 @@ router.put("/update/:rideId", async (req, res) => {
     const {
       date,
       time,
-      price,
+      pricePerSeat: price
       seatsAvailable,
       pickupLocation,
       stops,
@@ -384,8 +384,6 @@ router.put("/update/:rideId", async (req, res) => {
       { new: true }
     )
       .populate("workerId", "name email")
-      .populate("passengers.userId", "name email"); // ✅ populate user info inside passengers
-
     if (!updatedRide) return res.status(404).json({ error: "Ride not found" });
 
     // ✅ Email to driver
@@ -401,7 +399,7 @@ router.put("/update/:rideId", async (req, res) => {
             <ul>
               <li>Date: ${updatedRide.date}</li>
               <li>Time: ${updatedRide.time}</li>
-              <li>Price: $${updatedRide.price}</li>
+              <li>Price Per Seat: $${updatedRide.pricePerSeat}</li>
               <li>Seats Available: ${updatedRide.seatsAvailable}</li>
             </ul>
             <p>Keep your passengers updated 🚗</p>
