@@ -67,15 +67,15 @@ router.post("/post", async (req, res) => {
       to,
       date,
       time,
-      price: parseFloat(price),
+      pricePerSeat: parseFloat(price),
       seatsAvailable: parseInt(seatsAvailable),
       pickupLocation,
       stops: validStops,
       bookingType: bookingType || "manual",
       rideOptions: rideOptions || {},
       dropOffNotes: dropOffNotes || "",
-      passengers: [], // ✅ keep empty — passengers added after booking
       status: "active",
+      seatsBooked: 0,
     });
 
     await ride.save();
@@ -127,18 +127,18 @@ router.get("/worker/:workerId/requests", async (req, res) => {
         .sort({ createdAt: -1 })
         .lean();
 
-      const lastMessage = chat?.message || req?.bookingMessage || "";
+      const lastMessage = chat?.message || req?.message || "";
 
       if (req) {
         hub.push({
           rideId,
           requestId: req._id,
           customer: req.customerId || {},
-          seats: req.seats,
-          bookedFrom: req.bookedFrom || null,
-          bookedTo: req.bookedTo || null,
+          seats: req.seatsRequested,
+          bookedFrom: req.from || null,
+          bookedTo: req.to || null,
           message: lastMessage,
-          status: req.status,
+          status: req.requestStatus,
           createdAt: req.createdAt,
 
           // Ride data
@@ -203,7 +203,7 @@ router.post("/search", async (req, res) => {
     const processedRides = rides.map((ride) => {
       let matchedFrom = ride.from;
       let matchedTo = ride.to;
-      let finalPrice = ride.price;
+      let finalPrice = ride.pricePerSeat;
       let fromStop = null;
       let toStop = null;
 
@@ -290,15 +290,17 @@ router.get("/preview/:rideId", async (req, res) => {
 });
 
 // =====================================================
-// ✅ GET My Rides (Driver / Worker) — Active, Past, Completed, Cancelled, Disputed
+// ✅ GET My Rides (Driver / Worker) — Active, Past, Completed, Cancelled
 // =====================================================
 router.get("/my-rides/:workerId", async (req, res) => {
   try {
     const { workerId } = req.params;
+
     if (!workerId) {
       return res.status(400).json({ error: "Missing workerId" });
     }
 
+    // Today's date (yyyy-mm-dd)
     const today = new Date().toISOString().split("T")[0];
 
     // 🧭 Fetch ALL rides for this worker
@@ -306,57 +308,43 @@ router.get("/my-rides/:workerId", async (req, res) => {
       .sort({ date: -1, time: 1 })
       .lean();
 
-    // 🧠 Normalize and enrich ride data
+    // 🧠 Normalize + enrich ride data (simple version)
     const formatted = rides.map((r) => {
       const status = r.status || "active";
-      const rideStatus = r.rideStatus || status;
 
       const isArchived = Boolean(r.isArchived);
-      const isCancelled = Boolean(r.isCancelled);
-      const isWorkerCompleted =
-        status === "worker_completed" || rideStatus === "worker_completed";
-      const isDisputed =
-        status === "disputed" || rideStatus === "disputed" || r.escrowStatus === "disputed";
+      const isCancelled = status === "cancelled";
+      const isCompleted = status === "completed";
 
       // Flag if ride is "today"
       const rideDate = r.date ? r.date.toString().split("T")[0] : null;
       const isTodayRide = rideDate === today;
 
-      // 🏷️ Display-friendly status
-      let displayStatus = status;
-      if (isWorkerCompleted) displayStatus = "worker_completed";
-      if (isDisputed) displayStatus = "disputed";
-
       return {
         ...r,
-        status: displayStatus,
-        rideStatus,
+        status,
         isArchived,
         isCancelled,
-        isWorkerCompleted,
-        isDisputed,
+        isCompleted,
         isTodayRide,
       };
     });
 
-    // ✅ Include all useful rides (including worker_completed + disputed)
+    // 🟦 FINAL: include all useful rides
     const prioritized = formatted.filter(
       (r) =>
         [
           "active",
-          "pending",
-          "accepted",
           "completed",
           "cancelled",
-          "worker_completed",
-          "disputed",
         ].includes(r.status) || r.isTodayRide
     );
 
-    res.status(200).json(prioritized);
+    return res.status(200).json(prioritized);
+
   } catch (err) {
     console.error("❌ Failed to fetch rides:", err);
-    res.status(500).json({ error: "Server error" });
+    return res.status(500).json({ error: "Server error" });
   }
 });
 
