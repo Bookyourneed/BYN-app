@@ -100,7 +100,7 @@ router.get("/worker/:workerId/requests", async (req, res) => {
 
     // 1️⃣ Fetch all rides created by this worker
     const rides = await Ride.find({ workerId })
-      .select("_id from to date time price stops pickupLocation")
+      .select("_id from to date time pricePerSeat stops pickupLocation")
       .lean();
 
     if (!rides.length) {
@@ -113,16 +113,15 @@ router.get("/worker/:workerId/requests", async (req, res) => {
     for (const ride of rides) {
       const rideId = ride._id.toString();
 
-      // Fetch latest request for the hub preview
       const req = await BookingRequest.findOne({
         rideId,
-        requestStatus: { $in: ["pending", "active", "accepted"] }
+        requestStatus: { $in: ["pending", "accepted"] } // ✅ FIXED
       })
         .sort({ createdAt: -1 })
         .populate("customerId", "name profilePhotoUrl")
         .lean();
 
-      // Fetch latest chat message for this ride
+      // Fetch latest chat message
       const chat = await RideChat.findOne({ rideId })
         .sort({ createdAt: -1 })
         .lean();
@@ -138,7 +137,7 @@ router.get("/worker/:workerId/requests", async (req, res) => {
           bookedFrom: req.from || null,
           bookedTo: req.to || null,
           message: lastMessage,
-          status: req.requestStatus,
+          status: req.requestStatus, // ✅ FIXED
           createdAt: req.createdAt,
 
           // Ride data
@@ -147,7 +146,7 @@ router.get("/worker/:workerId/requests", async (req, res) => {
           date: ride.date,
           time: ride.time,
           pickupLocation: ride.pickupLocation,
-          pricePerSeat: ride.pricePerSeat,
+          pricePerSeat: ride.pricePerSeat, // ✅ FIXED
           stops: ride.stops,
 
           timestamp: req.createdAt
@@ -155,7 +154,6 @@ router.get("/worker/:workerId/requests", async (req, res) => {
       }
     }
 
-    // Sort newest first
     hub.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
     res.json({ rides, hub });
@@ -248,12 +246,14 @@ router.get("/preview/:rideId", async (req, res) => {
   try {
     const { from, to } = req.query;
 
-    const ride = await Ride.findById(req.params.rideId).populate("workerId", "name profilePhotoUrl driverProfile");
+    const ride = await Ride.findById(req.params.rideId)
+      .populate("workerId", "name profilePhotoUrl driverProfile");
+
     if (!ride) return res.status(404).json({ error: "Ride not found" });
 
     let matchedFrom = ride.from;
     let matchedTo = ride.to;
-    let finalPrice = ride.pricePerSeat;;
+    let finalPrice = ride.pricePerSeat; // ✅ FIXED
 
     if (ride.stops?.length && (from || to)) {
       let fromStop = null;
@@ -355,7 +355,7 @@ router.put("/update/:rideId", async (req, res) => {
     const {
       date,
       time,
-      pricePerSeat: price
+      pricePerSeat,   // ✅ FIXED
       seatsAvailable,
       pickupLocation,
       stops,
@@ -368,7 +368,7 @@ router.put("/update/:rideId", async (req, res) => {
     const updatedFields = {
       date,
       time,
-      price,
+      pricePerSeat,   // ✅ FIXED
       seatsAvailable,
       pickupLocation,
       stops,
@@ -382,11 +382,12 @@ router.put("/update/:rideId", async (req, res) => {
       req.params.rideId,
       updatedFields,
       { new: true }
-    )
-      .populate("workerId", "name email")
-    if (!updatedRide) return res.status(404).json({ error: "Ride not found" });
+    ).populate("workerId", "name email");
 
-    // ✅ Email to driver
+    if (!updatedRide)
+      return res.status(404).json({ error: "Ride not found" });
+
+    // Email to driver
     if (updatedRide.workerId?.email) {
       try {
         await sendEmail({
@@ -394,7 +395,8 @@ router.put("/update/:rideId", async (req, res) => {
           subject: "✅ Your Ride Details Were Updated",
           html: `
             <h2>Hi ${updatedRide.workerId.name || "Driver"},</h2>
-            <p>Your ride from <strong>${updatedRide.from}</strong> to <strong>${updatedRide.to}</strong> has been updated.</p>
+            <p>Your ride from <strong>${updatedRide.from}</strong> 
+            to <strong>${updatedRide.to}</strong> has been updated.</p>
             <p><b>New Details:</b></p>
             <ul>
               <li>Date: ${updatedRide.date}</li>
@@ -402,7 +404,6 @@ router.put("/update/:rideId", async (req, res) => {
               <li>Price Per Seat: $${updatedRide.pricePerSeat}</li>
               <li>Seats Available: ${updatedRide.seatsAvailable}</li>
             </ul>
-            <p>Keep your passengers updated 🚗</p>
             <br/>
             <p>— Team BYN</p>
           `,
@@ -412,42 +413,12 @@ router.put("/update/:rideId", async (req, res) => {
       }
     }
 
-    // ✅ Emails to all passengers
-    if (updatedRide.passengers?.length > 0) {
-      for (const passenger of updatedRide.passengers) {
-        const user = passenger.userId; // ✅ correct field
-        if (!user?.email) continue;
-        try {
-          await sendEmail({
-            to: user.email,
-            subject: "ℹ️ Ride Update Notification",
-            html: `
-              <h2>Hi ${user.name || "Passenger"},</h2>
-              <p>The ride you booked from <strong>${updatedRide.from}</strong> to <strong>${updatedRide.to}</strong> has been updated.</p>
-              <p><b>Updated Details:</b></p>
-              <ul>
-                <li>Date: ${updatedRide.date}</li>
-                <li>Time: ${updatedRide.time}</li>
-                <li>Price: $${updatedRide.price}</li>
-                <li>Seats Available: ${updatedRide.seatsAvailable}</li>
-              </ul>
-              <p>Please check your app for the latest information.</p>
-              <br/>
-              <p>— Team BYN</p>
-            `,
-          });
-        } catch (err) {
-          console.error(
-            `❌ Failed to email passenger ${user.email} about ride update:`,
-            err.message
-          );
-        }
-      }
-    }
+    // ❌ Removed passenger email loop (passengers no longer exist)
 
-    res
-      .status(200)
-      .json({ message: "✅ Ride updated & emails sent", ride: updatedRide });
+    res.status(200).json({
+      message: "✅ Ride updated & email sent",
+      ride: updatedRide,
+    });
   } catch (err) {
     console.error("❌ Error updating ride:", err);
     res.status(500).json({ error: "Server error" });
@@ -546,7 +517,7 @@ router.get("/:rideId/requests-and-chats", async (req, res) => {
     // 2️⃣ Fetch booking requests
     const requests = await BookingRequest.find({
       rideId,
-      status: { $in: ["pending", "active", "accepted"] },
+       requestStatus: { $in: ["pending", "accepted"] }  // ✅ FIXED
     })
       .populate("customerId", "name profilePhotoUrl email")
       .populate("rideId", "date time from to status")
