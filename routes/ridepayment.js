@@ -17,16 +17,17 @@ const { getIO } = require("../socket"); // ✅ adjust path if needed
 // ✅ 1️⃣ Create PaymentIntent (Hold funds in escrow)
 // =====================================================
 router.post("/create-intent", async (req, res) => {
-  const { rideId, customerId, seatsRequested = 1 } = req.body;
+  const { rideId, customerId, amount } = req.body; // ✅ now using `amount` from frontend
 
   try {
     const ride = await Ride.findById(rideId);
     const customer = await User.findById(customerId);
 
-    if (!ride || !customer)
+    if (!ride || !customer) {
       return res.status(404).json({ error: "Ride or Customer not found" });
+    }
 
-    // 🔐 Stripe Customer
+    // 🔐 Ensure Stripe Customer exists
     if (!customer.stripeCustomerId) {
       const stripeCustomer = await stripe.customers.create({
         email: customer.email,
@@ -36,14 +37,22 @@ router.post("/create-intent", async (req, res) => {
       await customer.save();
     }
 
-    // 💰 Calculate seat price
-    const basePrice = Number(ride.pricePerSeat) * seatsRequested;   // ✅ FIX
-    const bookingFee = 4.99;
-    const total = parseFloat((basePrice + bookingFee).toFixed(2));
+    // 💰 Use the amount passed from frontend (already base + fee)
+    let total = Number(amount);
+    if (!total || isNaN(total)) {
+      // 🔙 fallback if something breaks: use seat price
+      const seatPrice = Number(ride.pricePerSeat) || 0;
+      const bookingFee = 4.99;
+      total = parseFloat((seatPrice + bookingFee).toFixed(2));
+    }
 
-    // 💳 PaymentIntent (manual capture)
+    // For metadata (nice to keep breakdown)
+    const bookingFee = 4.99;
+    const basePrice = parseFloat((total - bookingFee).toFixed(2));
+
+    // 💳 Create PaymentIntent (manual capture)
     const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(total * 100),
+      amount: Math.round(total * 100), // cents
       currency: "cad",
       customer: customer.stripeCustomerId,
       capture_method: "manual",
@@ -54,7 +63,6 @@ router.post("/create-intent", async (req, res) => {
         customerId,
         basePrice,
         bookingFee,
-        seatsRequested,
         total,
       },
     });
@@ -65,10 +73,8 @@ router.post("/create-intent", async (req, res) => {
       paymentIntentId: paymentIntent.id,
       basePrice,
       bookingFee,
-      seatsRequested,
       total,
     });
-
   } catch (err) {
     console.error("❌ Create-intent error:", err.message);
     return res.status(500).json({ error: "Failed to create payment intent" });
