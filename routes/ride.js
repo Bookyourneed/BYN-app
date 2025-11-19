@@ -21,7 +21,7 @@ router.post("/post", async (req, res) => {
       to,
       date,
       time,
-      price,
+      pricePerSeat,   // 🔥 UPDATED
       seatsAvailable,
       pickupLocation,
       stops,
@@ -32,16 +32,25 @@ router.post("/post", async (req, res) => {
 
     console.log("📦 POST /ride -> body:", req.body);
 
-    // ✅ Validation
+    // ---------------------------------------------------
+    // 🔍 VALIDATION
+    // ---------------------------------------------------
     const missingFields = [];
     if (!workerId?.toString().trim()) missingFields.push("workerId");
     if (!from?.toString().trim()) missingFields.push("from");
     if (!to?.toString().trim()) missingFields.push("to");
     if (!date?.toString().trim()) missingFields.push("date");
     if (!time?.toString().trim()) missingFields.push("time");
-    if (price === undefined || isNaN(price)) missingFields.push("price");
-    if (seatsAvailable === undefined || isNaN(seatsAvailable)) missingFields.push("seatsAvailable");
-    if (!pickupLocation?.toString().trim()) missingFields.push("pickupLocation");
+
+    // 🔥 NEW VALIDATION FIELD
+    if (pricePerSeat === undefined || isNaN(pricePerSeat))
+      missingFields.push("pricePerSeat");
+
+    if (seatsAvailable === undefined || isNaN(seatsAvailable))
+      missingFields.push("seatsAvailable");
+
+    if (!pickupLocation?.toString().trim())
+      missingFields.push("pickupLocation");
 
     if (missingFields.length > 0) {
       return res.status(400).json({
@@ -51,23 +60,28 @@ router.post("/post", async (req, res) => {
 
     if (rideOptions && typeof rideOptions !== "object") {
       return res.status(400).json({
-        error: "rideOptions must be an object (e.g. { luggage: 'large', winterTires: true })",
+        error:
+          "rideOptions must be an object (e.g. { luggage: 'large', winterTires: true })",
       });
     }
 
-    // ✅ Validate stops
+    // ---------------------------------------------------
+    // 🛑 Validate stops (remove empty ones)
+    // ---------------------------------------------------
     const validStops = Array.isArray(stops)
-      ? stops.filter((s) => s.name && s.price && s.pickup && s.time)
+      ? stops.filter((s) => s.name && s.pickup && s.price && s.time)
       : [];
 
-    // ✅ Create ride
+    // ---------------------------------------------------
+    // 🟢 CREATE RIDE
+    // ---------------------------------------------------
     const ride = new Ride({
       workerId,
       from,
       to,
       date,
       time,
-      pricePerSeat: parseFloat(price),
+      pricePerSeat: parseFloat(pricePerSeat), // 🔥 UPDATED
       seatsAvailable: parseInt(seatsAvailable),
       pickupLocation,
       stops: validStops,
@@ -85,6 +99,7 @@ router.post("/post", async (req, res) => {
       message: "✅ Ride posted successfully",
       ride,
     });
+
   } catch (err) {
     console.error("❌ Error saving ride:", err.message, err.stack);
     res.status(500).json({ error: "Server error while posting ride" });

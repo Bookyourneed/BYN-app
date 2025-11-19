@@ -76,10 +76,6 @@ router.post("/create-intent", async (req, res) => {
 });
 
 
-// =====================================================
-// ✅ Step 2: Confirm booking AFTER successful payment
-//      + Socket + Email notify driver
-// =====================================================
 router.post("/confirm-booking", async (req, res) => {
   try {
     const {
@@ -90,6 +86,7 @@ router.post("/confirm-booking", async (req, res) => {
       message,
       paymentIntentId,
       seatsRequested = 1,
+      totalPrice, // <-- from frontend
     } = req.body;
 
     if (!rideId || !customerId || !paymentIntentId) {
@@ -103,9 +100,10 @@ router.post("/confirm-booking", async (req, res) => {
     const customer = await User.findById(customerId).select("name email");
     if (!customer) return res.status(404).json({ error: "Customer not found" });
 
-    // Booking price
-    const seatPrice = Number(ride.pricePerSeat);
-    const finalPrice = seatPrice * seatsRequested;
+    // Price fallback (if frontend didn't send totalPrice)
+    const seatPrice = Number(ride.pricePerSeat) || 0;
+    const computedPrice = seatPrice * seatsRequested;
+    const finalPrice = Number(totalPrice) || computedPrice;
 
     // Create / update booking
     const booking = await BookingRequest.findOneAndUpdate(
@@ -117,7 +115,9 @@ router.post("/confirm-booking", async (req, res) => {
           from,
           to,
           seatsRequested,
-          price: finalPrice,
+          price: finalPrice,      // legacy field
+          totalPrice: finalPrice, // new field
+          finalPrice: finalPrice, // unified field
           message,
           paymentIntentId,
           requestStatus: "pending",
@@ -143,6 +143,8 @@ router.post("/confirm-booking", async (req, res) => {
       pricePerSeat: seatPrice,
       seatsRequested,
       total: finalPrice,
+      totalPrice: finalPrice,
+      finalPrice: finalPrice,
       date: ride.date,
       time: ride.time,
       message,
@@ -162,7 +164,7 @@ router.post("/confirm-booking", async (req, res) => {
     // Notify customer
     io.to(`ride_customer_${customerId}`).emit("ride-request:customer", payload);
 
-    // Email the driver (YES we keep this!)
+    // Send email to driver
     if (ride.workerId?.email) {
       await sendRideEmail("rideRequest", {
         to: ride.workerId.email,
