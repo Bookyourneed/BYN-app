@@ -195,11 +195,7 @@ router.post("/confirm-booking", async (req, res) => {
 
 
 // =====================================================
-// ✅ Step 3: Worker Cancels Ride
-//   Cancels ALL active bookings,
-//   Issues refunds (if paid),
-//   Sends sockets + emails,
-//   Sets ride to cancelled ONLY after all bookings handled
+// 🚫 Worker cancels a ride (refund all PAID bookings)
 // =====================================================
 router.post("/cancel-by-worker", async (req, res) => {
   try {
@@ -211,52 +207,80 @@ router.post("/cancel-by-worker", async (req, res) => {
       return res.status(400).json({ error: "Missing rideId or workerId" });
     }
 
-    // Fetch ride
-    const ride = await Ride.findById(rideId)
-      .populate("workerId", "name email")
-      .lean();
-
+    // 1️⃣ Fetch ride & verify ownership
+    const ride = await Ride.findById(rideId).populate("workerId", "name email");
     if (!ride) return res.status(404).json({ error: "Ride not found" });
 
     if (String(ride.workerId?._id) !== String(workerId)) {
-      return res.status(403).json({ error: "You are not authorized to cancel this ride" });
+      return res
+        .status(403)
+        .json({ error: "You are not authorized to cancel this ride" });
     }
 
-    // Find all bookings that are pending or accepted (meaning seats were held)
+    // 2️⃣ Find all bookings that are still "active" in any way
+    // (we will refund only those that actually have a paymentIntentId)
+    const activeStatuses = [
+      "pending",
+      "accepted",
+      "worker_completed",
+      "dispute_pending",
+      "confirmed",
+    ];
+
     const bookings = await BookingRequest.find({
       rideId,
-      requestStatus: { $in: ["pending", "accepted"] }
+      requestStatus: { $in: activeStatuses },
     }).populate("customerId", "name email");
 
-    console.log(`🚫 Worker cancelled ride ${rideId}. ${bookings.length} bookings affected.`);
+    console.log(
+      `🚫 Worker cancelled ride ${rideId}. ${bookings.length} bookings affected.`
+    );
 
     for (const booking of bookings) {
       let refunded = false;
+      let stripeRefund = null;
 
-      // 💳 Refund if paymentIntent exists (Stripe refund placeholder)
+      // 3️⃣ Only refund those who actually PAID (have paymentIntentId)
       if (booking.paymentIntentId) {
-        // await stripe.refunds.create({
-        //   payment_intent: booking.paymentIntentId
-        // });
-
-        refunded = true;
+        try {
+          stripeRefund = await stripe.refunds.create({
+            payment_intent: booking.paymentIntentId,
+          });
+          refunded = true;
+          console.log(
+            `💸 Refunded booking ${booking._id} (PI: ${booking.paymentIntentId})`
+          );
+        } catch (err) {
+          console.error(
+            `❌ Failed to refund booking ${booking._id}:`,
+            err.message
+          );
+        }
       }
 
-      // Update booking fields
+      // 4️⃣ Update booking status
       booking.requestStatus = refunded ? "refunded" : "cancelled_by_driver";
+      booking.rideStatus = booking.requestStatus;
       booking.updatedAt = new Date();
-
+      booking.driverPaid = false;
       await booking.save();
 
-      // SOCKET → notify customer
-      io.to(`ride_customer_${booking.customerId._id}`).emit("ride-cancelled", {
-        bookingId: booking._id,
-        rideId,
-        refunded,
-        message: `Your driver ${ride.workerId.name} cancelled this ride. ${refunded ? "A refund will be issued automatically." : ""}`
-      });
+      // 5️⃣ SOCKET → notify customer app
+      if (io) {
+        io.to(`ride_customer_${booking.customerId._id}`).emit("ride-cancelled", {
+          bookingId: booking._id,
+          rideId,
+          refunded,
+          status: booking.requestStatus,
+          message: `Your driver ${ride.workerId.name} cancelled this ride. ${
+            refunded
+              ? "Your payment (including booking fee) will be refunded."
+              : "No payment was captured, so no refund was needed."
+          }`,
+        });
+      }
 
-      // EMAIL → notify customer
+      // 6️⃣ EMAIL → notify customer
       if (booking.customerId?.email) {
         await sendRideEmail("rideCancelled", {
           to: booking.customerId.email,
@@ -270,26 +294,30 @@ router.post("/cancel-by-worker", async (req, res) => {
       }
     }
 
-    // AFTER all bookings handled → cancel the ride globally
-    await Ride.findByIdAndUpdate(rideId, { status: "cancelled" });
+    // 7️⃣ Mark ride fully cancelled so it won't appear as bookable / payable
+    ride.status = "cancelled";
+    await ride.save();
 
-    // Notify worker UI
-    io.to(`ride_driver_${workerId}`).emit("ride-cancelled:driver", {
-      rideId,
-      message: "You cancelled this ride. All passengers have been refunded or notified.",
-    });
+    // 8️⃣ Notify worker UI
+    if (io) {
+      io.to(`ride_driver_${workerId}`).emit("ride-cancelled:driver", {
+        rideId,
+        message:
+          "You cancelled this ride. All passengers have been refunded (if paid) or notified.",
+      });
 
-    // Notify ride room
-    io.to(`ride_${rideId}`).emit("ride-cancelled:room", {
-      rideId,
-      status: "cancelled",
-    });
+      io.to(`ride_${rideId}`).emit("ride-cancelled:room", {
+        rideId,
+        status: "cancelled",
+      });
+    }
 
     console.log(`📧 All cancellation emails sent for ride ${rideId}`);
 
     return res.json({
       success: true,
-      message: "Ride cancelled. All bookings updated and refunds issued where applicable.",
+      message:
+        "Ride cancelled. All active bookings updated and refunds issued where applicable.",
     });
   } catch (err) {
     console.error("❌ Cancel-by-worker error:", err);
@@ -798,7 +826,6 @@ router.post("/worker-complete", async (req, res) => {
       return res.status(400).json({ error: "bookingId and workerId are required" });
     }
 
-    // Fetch booking with ride + rider
     const booking = await BookingRequest.findById(bookingId)
       .populate("customerId", "name email")
       .populate({
@@ -806,57 +833,55 @@ router.post("/worker-complete", async (req, res) => {
         populate: { path: "workerId", select: "name email" }
       });
 
-    if (!booking) {
-      return res.status(404).json({ error: "Booking not found" });
-    }
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
 
-    // Ensure the driver owns this booking (security)
     if (String(booking.rideId.workerId._id) !== String(workerId)) {
       return res.status(403).json({ error: "Unauthorized – driver mismatch" });
     }
 
-    // Prevent double-complete
-    if (booking.driverComplete) {
-      return res.json({ success: true, message: "Driver already marked complete." });
+    // prevent double complete
+    if (booking.requestStatus === "worker_completed") {
+      return res.json({ success: true, message: "Already marked complete." });
     }
 
-    // Mark booking complete by driver
+    // UPDATE BOOKING
     booking.driverComplete = true;
     booking.driverCompletedAt = new Date();
+    booking.requestStatus = "worker_completed";
     await booking.save();
 
-    const ride = booking.rideId;
-    const customer = booking.customerId;
-    const driver = ride.workerId;
+    // UPDATE RIDE (optional but recommended)
+    booking.rideId.rideStatus = "worker_completed";
+    await booking.rideId.save();
 
     // SOCKET → notify customer
-    io.to(`ride_customer_${customer._id}`).emit("booking:driverComplete", {
+    io.to(`ride_customer_${booking.customerId._id}`).emit("ride-status-update", {
       bookingId,
-      rideId: ride._id,
-      message: `Your driver ${driver.name} marked this ride as complete. Please confirm.`,
+      rideId: booking.rideId._id,
+      status: "worker_completed",
     });
 
     // SOCKET → notify driver
-    io.to(`ride_driver_${driver._id}`).emit("booking:driverComplete:driver", {
+    io.to(`ride_driver_${workerId}`).emit("ride-status-update:driver", {
       bookingId,
-      rideId: ride._id,
-      message: "You marked this booking as complete.",
+      rideId: booking.rideId._id,
+      status: "worker_completed",
     });
 
-    // EMAIL → notify customer
-    if (customer.email) {
+    // EMAIL
+    if (booking.customerId.email) {
       await sendRideEmail("driverMarkedComplete", {
-        to: customer.email,
-        customerName: customer.name,
-        driverName: driver.name,
-        from: ride.from,
-        toLocation: ride.to,
-        date: ride.date,
-        time: ride.time,
+        to: booking.customerId.email,
+        customerName: booking.customerId.name,
+        driverName: booking.rideId.workerId.name,
+        from: booking.rideId.from,
+        toLocation: booking.rideId.to,
+        date: booking.rideId.date,
+        time: booking.rideId.time,
       });
     }
 
-    res.json({
+    return res.json({
       success: true,
       message: "Booking marked complete by driver. Awaiting customer confirmation.",
     });
