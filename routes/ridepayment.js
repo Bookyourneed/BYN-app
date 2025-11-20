@@ -893,7 +893,7 @@ router.post("/worker-complete", async (req, res) => {
 });
 
 // =====================================================
-// ✅ CUSTOMER MARKS BOOKING COMPLETE (new booking-based system)
+// ✅ CUSTOMER MARKS BOOKING COMPLETE + AUTO-PAYOUT
 // =====================================================
 router.post("/customer-complete", async (req, res) => {
   try {
@@ -902,7 +902,9 @@ router.post("/customer-complete", async (req, res) => {
     const { sendRideEmail } = require("../emailService");
 
     if (!bookingId || !customerId) {
-      return res.status(400).json({ error: "bookingId and customerId are required" });
+      return res.status(400).json({
+        error: "bookingId and customerId are required"
+      });
     }
 
     // Fetch booking
@@ -910,47 +912,55 @@ router.post("/customer-complete", async (req, res) => {
       .populate("customerId", "name email")
       .populate({
         path: "rideId",
-        populate: { path: "workerId", select: "name email" }
+        populate: { path: "workerId", select: "name email stripeAccountId" }
       });
 
     if (!booking) {
       return res.status(404).json({ error: "Booking not found" });
     }
 
-    // Security check: correct customer
+    // Security check
     if (String(booking.customerId._id) !== String(customerId)) {
-      return res.status(403).json({ error: "Unauthorized – customer mismatch" });
+      return res.status(403).json({ error: "Unauthorized customer" });
     }
 
-    // Prevent duplicate marking
+    // Prevent double confirm
     if (booking.customerComplete) {
-      return res.json({ success: true, message: "Customer already marked complete." });
+      return res.json({
+        success: true,
+        message: "Customer already marked complete.",
+        alreadyComplete: true
+      });
     }
 
-    // Mark booking complete by customer
+    // Mark customer complete
     booking.customerComplete = true;
     booking.customerCompletedAt = new Date();
+    booking.requestStatus = "completed";
     await booking.save();
 
     const ride = booking.rideId;
     const customer = booking.customerId;
     const driver = ride.workerId;
 
-    // SOCKET → notify driver
+    // Notify driver
     io.to(`ride_driver_${driver._id}`).emit("booking:customerComplete", {
       bookingId,
       rideId: ride._id,
-      message: `Customer ${customer.name} marked the booking as complete.`,
+      message: `Customer ${customer.name} confirmed the ride.`
     });
 
-    // SOCKET → notify customer
-    io.to(`ride_customer_${customer._id}`).emit("booking:customerComplete:customer", {
-      bookingId,
-      rideId: ride._id,
-      message: "You marked the ride as complete.",
-    });
+    // Notify customer
+    io.to(`ride_customer_${customer._id}`).emit(
+      "booking:customerComplete:customer",
+      {
+        bookingId,
+        rideId: ride._id,
+        message: "You confirmed this ride."
+      }
+    );
 
-    // EMAIL → driver
+    // Email → driver
     if (driver.email) {
       await sendRideEmail("customerMarkedComplete", {
         to: driver.email,
@@ -959,33 +969,50 @@ router.post("/customer-complete", async (req, res) => {
         from: ride.from,
         toLocation: ride.to,
         date: ride.date,
-        time: ride.time,
+        time: ride.time
       });
     }
 
-    // If BOTH completed → booking is ready for payout
-    let readyForPayout = false;
+    // =====================================================
+    // ⭐ AUTO-PAYOUT (NEW!)
+    // =====================================================
+    let payoutSuccess = false;
 
     if (booking.driverComplete && booking.customerComplete) {
-      readyForPayout = true;
+      console.log("🔵 Both sides completed → releasing payout now.");
 
-      io.to(`ride_driver_${driver._id}`).emit("booking:readyForPayout", {
-        bookingId,
-        rideId: ride._id,
-        message: "Booking completed by both sides. Awaiting admin release.",
-      });
+      try {
+        // release full payment for this booking only
+        const transfer = await stripe.transfers.create({
+          amount: Math.round(Number(booking.finalPrice) * 100),
+          currency: "cad",
+          destination: driver.stripeAccountId,
+          transfer_group: `ride_${ride._id}`
+        });
 
-      io.to(`ride_customer_${customer._id}`).emit("booking:readyForPayout", {
-        bookingId,
-        rideId: ride._id,
-        message: "Ride fully completed. Admin will release payment soon.",
-      });
+        payoutSuccess = true;
+        booking.driverPaid = true;
+        booking.paidOutAt = new Date();
+        await booking.save();
+
+        io.to(`ride_driver_${driver._id}`).emit("booking:payoutReleased", {
+          bookingId,
+          amount: booking.finalPrice
+        });
+
+        io.to(`ride_customer_${customer._id}`).emit("booking:payoutReleased", {
+          bookingId
+        });
+
+      } catch (err) {
+        console.error("❌ Stripe payout failed:", err.message);
+      }
     }
 
     return res.json({
       success: true,
       message: "Customer marked booking complete.",
-      readyForPayout,
+      payoutSuccess
     });
 
   } catch (err) {
