@@ -25,12 +25,27 @@ const BookingRequestSchema = new mongoose.Schema(
     },
 
     /* 🔥 PRICE FIELDS */
-    price: Number,       // legacy support
-    totalPrice: Number,  // frontend + trips
-    finalPrice: Number,  // for backend calculations
+    price: Number,
+    totalPrice: Number,
+    finalPrice: Number,
 
     /* 🔥 PAYMENT */
-    paymentIntentId: { type: String },
+    paymentIntentId: String,
+    paymentStatus: {
+      type: String,
+      enum: ["authorized", "captured", "refunded", "failed"],
+      default: "authorized",
+    },
+
+    payoutStatus: {
+      type: String,
+      enum: ["pending", "paid", "failed"],
+      default: "pending",
+    },
+
+    driverPaid: { type: Boolean, default: false },
+    paidOutAt: { type: Date },
+    refundedAt: { type: Date },
 
     /* 🔥 STATUS */
     requestStatus: {
@@ -39,27 +54,37 @@ const BookingRequestSchema = new mongoose.Schema(
         "pending",
         "accepted",
         "declined",
-        "cancelled",
-        "completed",
         "worker_completed",
+        "completed",
+        "cancelled_by_driver",
         "refunded",
         "disputed",
       ],
       default: "pending",
     },
 
+    /* 🔥 COMPLETION */
     driverComplete: { type: Boolean, default: false },
     customerComplete: { type: Boolean, default: false },
 
     driverCompletedAt: { type: Date },
     customerCompletedAt: { type: Date },
 
+    acceptedAt: { type: Date },
+
+    /* 🔥 DISPUTES */
+    disputedBy: { type: String, enum: ["customer", "worker", null], default: null },
+    disputeReason: { type: String },
+    disputedAt: { type: Date },
+
+    /* 🔥 CLEANUP */
+    archived: { type: Boolean, default: false },
+
     updatedAt: { type: Date, default: Date.now },
   },
   { timestamps: true }
 );
 
-// Auto-update timestamps
 BookingRequestSchema.pre("save", function (next) {
   this.updatedAt = new Date();
   next();

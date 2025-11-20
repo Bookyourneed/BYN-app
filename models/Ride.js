@@ -44,9 +44,21 @@ const RideSchema = new mongoose.Schema(
       default: "manual",
     },
 
+    // ⭐️ UPDATED ENUM – supports all real ride states
     status: {
       type: String,
-      enum: ["active", "completed", "cancelled"],
+      enum: [
+        "active",               // newly created, available
+        "pending",              // waiting for confirmations
+        "accepted",             // a booking accepted
+        "worker_completed",     // driver marked complete
+        "customer_completed",   // customer marked complete
+        "fully_completed",      // both sides done
+        "cancelled_by_driver",  // driver cancelled ride
+        "cancelled",            // generic cancelled
+        "refunded",             // refunded bookings
+        "completed"             // legacy final completed
+      ],
       default: "active",
     },
 
@@ -62,3 +74,4 @@ RideSchema.pre("save", function (next) {
 });
 
 module.exports = mongoose.model("Ride", RideSchema);
+
