@@ -321,13 +321,11 @@ router.get("/my-rides/:workerId", async (req, res) => {
       .sort({ date: -1, time: 1 })
       .lean();
 
-    // 🧠 Normalize + enrich ride data (simple version)
+    // 🧠 Normalize + enrich ride data
     const formatted = rides.map((r) => {
       const status = r.status || "active";
 
       const isArchived = Boolean(r.isArchived);
-      const isCancelled = status === "cancelled";
-      const isCompleted = status === "completed";
 
       // Flag if ride is "today"
       const rideDate = r.date ? r.date.toString().split("T")[0] : null;
@@ -337,20 +335,24 @@ router.get("/my-rides/:workerId", async (req, res) => {
         ...r,
         status,
         isArchived,
-        isCancelled,
-        isCompleted,
         isTodayRide,
       };
     });
 
-    // 🟦 FINAL: include all useful rides
-    const prioritized = formatted.filter(
-      (r) =>
-        [
-          "active",
-          "completed",
-          "cancelled",
-        ].includes(r.status) || r.isTodayRide
+    // 🟦 Include ALL important statuses
+    const prioritized = formatted.filter((r) =>
+      [
+        "active",
+        "pending",
+        "accepted",
+        "worker_completed",
+        "customer_completed",
+        "fully_completed",
+        "completed",
+        "cancelled",
+        "refunded",
+        "disputed",
+      ].includes(r.status) || r.isTodayRide
     );
 
     return res.status(200).json(prioritized);
@@ -519,10 +521,12 @@ router.get("/:rideId/requests-and-chats", async (req, res) => {
     console.log("📅 Today's date:", today);
     console.log("🛣️ Ride date:", ride.date);
 
-    // 2️⃣ Fetch booking requests
+    // 2️⃣ Fetch ALL booking requests except declined/refunded
     const requests = await BookingRequest.find({
       rideId,
-       requestStatus: { $in: ["pending", "accepted"] }  // ✅ FIXED
+      requestStatus: { 
+        $nin: ["declined", "refunded", "cancelled"] 
+      }
     })
       .populate("customerId", "name profilePhotoUrl email")
       .populate("rideId", "date time from to status")
