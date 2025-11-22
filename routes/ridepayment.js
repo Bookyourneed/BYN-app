@@ -1020,19 +1020,21 @@ router.post("/customer-complete", async (req, res) => {
       });
     }
 
-    // Fetch booking
+    // Fetch booking + ride + driver
     const booking = await BookingRequest.findById(bookingId)
       .populate("customerId", "name email")
       .populate({
         path: "rideId",
-        populate: { path: "workerId", select: "name email walletBalance walletHistory totalEarnings" }
+        populate: {
+          path: "workerId",
+          select: "name email walletBalance walletHistory totalEarnings",
+        },
       });
 
     if (!booking) {
       return res.status(404).json({ error: "Booking not found" });
     }
 
-    // Security check
     if (String(booking.customerId._id) !== String(customerId)) {
       return res.status(403).json({ error: "Unauthorized customer" });
     }
@@ -1041,7 +1043,6 @@ router.post("/customer-complete", async (req, res) => {
     const driver = ride.workerId;
     const customer = booking.customerId;
 
-    // Prevent double-confirm
     if (booking.customerComplete) {
       return res.json({
         success: true,
@@ -1050,22 +1051,18 @@ router.post("/customer-complete", async (req, res) => {
       });
     }
 
-    // =====================================================
-    // 1️⃣ CUSTOMER MARKS COMPLETE
-    // =====================================================
+    // 1️⃣ Mark customer complete
     booking.customerComplete = true;
     booking.customerCompletedAt = new Date();
 
-    // If driver also completed → finalize booking
+    // If driver also completed → booking done
     if (booking.driverComplete) {
       booking.requestStatus = "completed";
     }
 
     await booking.save();
 
-    // =====================================================
-    // 📡 SOCKET UPDATES
-    // =====================================================
+    // 2️⃣ SOCKET EVENTS
     io.to(`ride_driver_${driver._id}`).emit("booking:customerComplete", {
       bookingId,
       rideId: ride._id,
@@ -1081,7 +1078,7 @@ router.post("/customer-complete", async (req, res) => {
       }
     );
 
-    // Email → driver
+    // EMAIL → driver
     if (driver.email) {
       await sendRideEmail("customerMarkedComplete", {
         to: driver.email,
@@ -1094,40 +1091,28 @@ router.post("/customer-complete", async (req, res) => {
       });
     }
 
-    // =====================================================
-    // ⭐ 2️⃣ PAYOUT LOGIC (INTERNAL WALLET) — MOST IMPORTANT
-    // =====================================================
-
+    // 3️⃣ PAYOUT LOGIC
     let payoutSuccess = false;
 
-    // Only pay if both driver + customer confirmed
-    // And ONLY IF NOT already paid
     if (
       booking.driverComplete &&
       booking.customerComplete &&
       !booking.driverPaid
     ) {
-      console.log("💰 Releasing payout to driver wallet for booking:", bookingId);
-
       const amount = Number(booking.finalPrice) || 0;
 
-      // ----------------------------
-      // COMMISSION SYSTEM FOR RIDES
-      // ----------------------------
-      let commission = 0.0445; // base 4.45%
-      const previousEarnings = driver.totalEarnings || 0;
+      // Commission calculation
+      let commission = 0.0445;
+      const prevEarn = driver.totalEarnings || 0;
 
-      if (previousEarnings >= 100 && previousEarnings < 300)
-        commission = 0.05;
+      if (prevEarn >= 100 && prevEarn < 300) commission = 0.05;
+      if (prevEarn >= 300) commission = 20 / amount; // flat $20
 
-      if (previousEarnings >= 300)
-        commission = 20 / amount; // flat $20 cap
+      const payout =
+        commission >= 1
+          ? amount - 20
+          : parseFloat((amount * (1 - commission)).toFixed(2));
 
-      const payout = commission >= 1
-        ? amount - 20
-        : parseFloat((amount * (1 - commission)).toFixed(2));
-
-      // Update wallet
       driver.walletBalance = (driver.walletBalance || 0) + payout;
 
       driver.walletHistory.push({
@@ -1141,22 +1126,30 @@ router.post("/customer-complete", async (req, res) => {
         }.`,
       });
 
-      // Update earnings
       driver.totalEarnings = (driver.totalEarnings || 0) + payout;
       await driver.save();
 
-      // Update booking flags
       booking.driverPaid = true;
       booking.paidOutAt = new Date();
       booking.payoutStatus = "paid";
       await booking.save();
 
-      // SOCKET → driver wallet update
       io.to(`ride_driver_${driver._id}`).emit("wallet:update", {
         walletBalance: driver.walletBalance,
       });
 
       payoutSuccess = true;
+    }
+
+    // 4️⃣ CHECK IF EVERY BOOKING FOR THIS RIDE IS DONE
+    const remaining = await BookingRequest.exists({
+      rideId: ride._id,
+      requestStatus: { $nin: ["completed", "refunded", "cancelled"] },
+    });
+
+    if (!remaining) {
+      ride.status = "completed";
+      await ride.save();
     }
 
     return res.json({
