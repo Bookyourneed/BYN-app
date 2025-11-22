@@ -303,7 +303,7 @@ router.get("/preview/:rideId", async (req, res) => {
 });
 
 // =====================================================
-// ✅ GET My Rides (Driver / Worker) — Active, Past, Completed, Cancelled
+// ✅ GET My Rides (Driver / Worker) — with FULL STATUS
 // =====================================================
 router.get("/my-rides/:workerId", async (req, res) => {
   try {
@@ -316,18 +316,25 @@ router.get("/my-rides/:workerId", async (req, res) => {
     // Today's date (yyyy-mm-dd)
     const today = new Date().toISOString().split("T")[0];
 
-    // 🧭 Fetch ALL rides for this worker
+    // Fetch rides
     const rides = await Ride.find({ workerId })
       .sort({ date: -1, time: 1 })
       .lean();
 
-    // 🧠 Normalize + enrich ride data
     const formatted = rides.map((r) => {
-      const status = r.status || "active";
+      let status = r.status || "active";
+
+      // ⭐ AUTO-SET FULL status
+      if (
+        typeof r.seatsBooked === "number" &&
+        typeof r.seatsAvailable === "number" &&
+        r.seatsBooked >= r.seatsAvailable &&
+        ["active", "pending", "accepted"].includes(status)
+      ) {
+        status = "full";
+      }
 
       const isArchived = Boolean(r.isArchived);
-
-      // Flag if ride is "today"
       const rideDate = r.date ? r.date.toString().split("T")[0] : null;
       const isTodayRide = rideDate === today;
 
@@ -339,12 +346,13 @@ router.get("/my-rides/:workerId", async (req, res) => {
       };
     });
 
-    // 🟦 Include ALL important statuses
+    // Include all relevant statuses
     const prioritized = formatted.filter((r) =>
       [
         "active",
         "pending",
         "accepted",
+        "full",                // ⭐ ADDED
         "worker_completed",
         "customer_completed",
         "fully_completed",
