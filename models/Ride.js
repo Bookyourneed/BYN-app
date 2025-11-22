@@ -44,13 +44,14 @@ const RideSchema = new mongoose.Schema(
       default: "manual",
     },
 
-    // ⭐️ UPDATED ENUM – supports all real ride states
+    // ⭐️ UPDATED ENUM – now includes "full"
     status: {
       type: String,
       enum: [
-        "active",               // newly created, available
-        "pending",              // waiting for confirmations
+        "active",               // open / available
+        "pending",              // request in progress
         "accepted",             // a booking accepted
+        "full",                 // NO seats left (important!)
         "worker_completed",     // driver marked complete
         "customer_completed",   // customer marked complete
         "fully_completed",      // both sides done
@@ -74,4 +75,3 @@ RideSchema.pre("save", function (next) {
 });
 
 module.exports = mongoose.model("Ride", RideSchema);
-

@@ -956,7 +956,7 @@ router.post("/worker-complete", async (req, res) => {
     });
 
     if (!incompleteExists) {
-      ride.status = "driver_completed";
+      ride.status = "worker_completed";
       await ride.save();
     }
 
