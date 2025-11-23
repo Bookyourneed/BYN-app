@@ -303,7 +303,7 @@ router.get("/preview/:rideId", async (req, res) => {
 });
 
 // =====================================================
-// ✅ GET My Rides (Driver / Worker) — with FULL STATUS
+// ✅ GET My Rides (Driver / Worker) — FULL LOGIC + BOOKING STATS
 // =====================================================
 router.get("/my-rides/:workerId", async (req, res) => {
   try {
@@ -313,18 +313,51 @@ router.get("/my-rides/:workerId", async (req, res) => {
       return res.status(400).json({ error: "Missing workerId" });
     }
 
-    // Today's date (yyyy-mm-dd)
     const today = new Date().toISOString().split("T")[0];
 
-    // Fetch rides
+    // 1️⃣ Fetch all rides of this driver
     const rides = await Ride.find({ workerId })
       .sort({ date: -1, time: 1 })
       .lean();
 
+    if (!rides.length) {
+      return res.json([]);
+    }
+
+    const rideIds = rides.map((r) => r._id);
+
+    // 2️⃣ Fetch ALL bookings for these rides
+    const bookings = await BookingRequest.find({
+      rideId: { $in: rideIds },
+    }).lean();
+
+    // 3️⃣ Group bookings per ride
+    const grouped = {};
+    bookings.forEach((b) => {
+      const r = String(b.rideId);
+      if (!grouped[r]) grouped[r] = [];
+      grouped[r].push(b);
+    });
+
+    // 4️⃣ Build final ride output
     const formatted = rides.map((r) => {
       let status = r.status || "active";
 
-      // ⭐ AUTO-SET FULL status
+      // Extract ride bookings
+      const rideBookings = grouped[String(r._id)] || [];
+
+      // Filter accepted only
+      const accepted = rideBookings.filter(
+        (b) => b.requestStatus === "accepted"
+      );
+
+      const driverCompleted = accepted.filter((b) => b.driverComplete).length;
+      const customerCompleted = accepted.filter((b) => b.customerComplete).length;
+
+      const pendingDriver = accepted.length - driverCompleted;
+      const pendingCustomer = accepted.length - customerCompleted;
+
+      // ⭐ AUTO MARK FULL
       if (
         typeof r.seatsBooked === "number" &&
         typeof r.seatsAvailable === "number" &&
@@ -334,25 +367,32 @@ router.get("/my-rides/:workerId", async (req, res) => {
         status = "full";
       }
 
-      const isArchived = Boolean(r.isArchived);
       const rideDate = r.date ? r.date.toString().split("T")[0] : null;
       const isTodayRide = rideDate === today;
 
       return {
         ...r,
         status,
-        isArchived,
         isTodayRide,
+
+        // ⭐ NEW STATS FOR UI
+        acceptedCount: accepted.length,
+        driverCompletedCount: driverCompleted,
+        customerCompletedCount: customerCompleted,
+        pendingDriverCount: pendingDriver,
+        pendingCustomerCount: pendingCustomer,
+
+        bookings: accepted, // full passenger list
       };
     });
 
-    // Include all relevant statuses
+    // 5️⃣ Show all important statuses
     const prioritized = formatted.filter((r) =>
       [
         "active",
         "pending",
         "accepted",
-        "full",                // ⭐ ADDED
+        "full",
         "worker_completed",
         "customer_completed",
         "fully_completed",
@@ -364,7 +404,6 @@ router.get("/my-rides/:workerId", async (req, res) => {
     );
 
     return res.status(200).json(prioritized);
-
   } catch (err) {
     console.error("❌ Failed to fetch rides:", err);
     return res.status(500).json({ error: "Server error" });
