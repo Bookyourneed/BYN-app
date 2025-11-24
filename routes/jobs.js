@@ -480,25 +480,48 @@ router.get("/user-jobs/:email", async (req, res) => {
 
   try {
     const allJobs = await Job.find({ email })
-      .populate("assignedTo", "name email")
+      .populate("assignedTo", "name email phone profilePhotoUrl")  // 🔥 NEW: get worker contact too
       .populate({
         path: "bids",
         populate: {
           path: "workerId",
-          select: "name email",
+          select: "name email phone profilePhotoUrl",
         },
         select: "price message changeRequest workerId status",
       })
       .sort({ createdAt: -1 })
       .lean();
 
-    const pending = allJobs.filter(
+    // ===============================
+    // ⭐ ENHANCEMENT: Ensure worker contact appears in job
+    // ===============================
+    const withWorkerDetails = allJobs.map((job) => ({
+      ...job,
+
+      // 🔥 If worker assigned, use job fields (from accept-bid route)
+      workerName: job.workerName || job.assignedTo?.name || "",
+      workerPhone: job.workerPhone || job.assignedTo?.phone || "",
+      workerEmail: job.workerEmail || job.assignedTo?.email || "",
+      workerProfilePhoto:
+        job.workerProfilePhoto || job.assignedTo?.profilePhotoUrl || "",
+
+      // 🔥 Customer contact exists too (optional future)
+      customerName: job.customerName || "",
+      customerPhone: job.customerPhone || "",
+      customerEmail: job.customerEmail || "",
+      customerProfilePhoto: job.customerProfilePhoto || "",
+    }));
+
+    // ===============================
+    // ⭐ EXISTING LOGIC (no changes)
+    // ===============================
+    const pending = withWorkerDetails.filter(
       (j) =>
         ["pending", "reopened"].includes(j.status) ||
         (j.status === "assigned" && !j.assignedTo)
     );
 
-    const assigned = allJobs.filter((j) =>
+    const assigned = withWorkerDetails.filter((j) =>
       [
         "assigned",
         "accepted",
@@ -509,15 +532,13 @@ router.get("/user-jobs/:email", async (req, res) => {
       ].includes(j.status)
     );
 
-    const completed = allJobs.filter((j) =>
+    const completed = withWorkerDetails.filter((j) =>
       ["completed", "customer_confirmed", "auto_confirmed"].includes(j.status)
     );
 
-    const cancelled = allJobs.filter((j) =>
+    const cancelled = withWorkerDetails.filter((j) =>
       ["cancelled", "refunded", "partial_refund"].includes(j.status)
     );
-
-    // 🧹 Removed io.to(...emit("job:refresh")) because it causes recursive refresh loops
 
     res.status(200).json({ pending, assigned, completed, cancelled });
   } catch (err) {
@@ -881,36 +902,70 @@ router.post("/accept-bid", async (req, res) => {
       return res.status(404).json({ message: "Worker or bid not found" });
     }
 
-    // ✅ Update job status
+    // ============================================
+    // ✅ UPDATE JOB STATUS + ASSIGN WORKER
+    // ============================================
     job.status = "assigned";
     job.assignedTo = workerId;
     job.assignedPrice = acceptedBid.price;
+
+    // ============================================
+    // 🔥 NEW — SAVE WORKER CONTACT DETAILS IN JOB  
+    // (So the customer can see worker phone/name)
+    // ============================================
+    job.workerName = worker.name || "";
+    job.workerPhone = worker.phone || "";
+    job.workerEmail = worker.email || "";
+    job.workerProfilePhoto = worker.profilePhotoUrl || "";
+
+    // ============================================
+    // 🔥 NEW — SAVE CUSTOMER CONTACT FOR WORKER  
+    // (So worker sees customer phone/name in dashboard)
+    // ============================================
+    job.customerName = customer?.name || "";
+    job.customerPhone = customer?.phone || "";
+    job.customerEmail = customer?.email || "";
+    job.customerProfilePhoto = customer?.profilePhotoUrl || "";
+
     await job.save();
     console.log("✅ Job assigned:", job._id);
 
-    /* ////////////////= */
-    /* ⚡ SOCKET.IO REAL-TIME EMITS                              */
-    /* ////////////////= */
+    // ============================================
+    // ⚡ SOCKET.IO EMITS (unchanged, preserved)
+    // ============================================
     try {
       const io = getIO();
 
-      // 🔹 Notify selected worker (assigned)
+      // 🔹 Notify selected worker
       io.to(`worker_${workerId}`).emit("job:assigned", {
         jobId,
         message: "🎉 You’ve been assigned this job!",
+        customerDetails: {
+          name: customer?.name,
+          phone: customer?.phone,
+          email: customer?.email,
+          photo: customer?.profilePhotoUrl,
+        },
       });
       console.log(`⚡ Socket → job:assigned → worker_${workerId}`);
 
-      // 🔹 Notify customer (status update)
+      // 🔹 Notify customer
       if (job.customerId?._id) {
         io.to(`customer_${job.customerId._id}`).emit("job:update", {
           jobId,
           status: "assigned",
+          workerDetails: {
+            id: worker._id,
+            name: worker.name,
+            phone: worker.phone,
+            email: worker.email,
+            photo: worker.profilePhotoUrl,
+          },
         });
         console.log(`⚡ Socket → job:update → customer_${job.customerId._id}`);
       }
 
-      // 🔹 Notify all rejected workers
+      // 🔹 Notify rejected workers
       const rejectedBids = await Bid.find({
         jobId,
         workerId: { $ne: workerId },
@@ -922,18 +977,18 @@ router.post("/accept-bid", async (req, res) => {
             jobId,
             status: "rejected",
           });
-          console.log(`⚡ Socket → job:update (rejected) → worker_${b.workerId._id}`);
+          console.log(
+            `⚡ Socket → job:update (rejected) → worker_${b.workerId._id}`
+          );
         }
       });
     } catch (socketErr) {
       console.error("⚠️ Socket emit failed:", socketErr.message);
     }
 
-    /* ////////////////= */
-    /* 📧 EMAIL NOTIFICATIONS                                   */
-    /* ////////////////= */
-
-    // ✅ Notify selected worker
+    // ============================================
+    // 📧 EMAIL NOTIFICATIONS  (unchanged)
+    // ============================================
     if (worker?.email) {
       await sendEmailSafe({
         to: worker.email,
@@ -944,7 +999,9 @@ router.post("/accept-bid", async (req, res) => {
           <p>You’ve been assigned the job: <strong>${job.jobTitle}</strong>.</p>
           <p><strong>Accepted Bid:</strong> $${acceptedBid.price}</p>
           <p><strong>Location:</strong> ${job.location || "N/A"}</p>
-          <p><strong>Scheduled:</strong> ${new Date(job.scheduledAt).toLocaleString()}</p>
+          <p><strong>Scheduled:</strong> ${new Date(
+            job.scheduledAt
+          ).toLocaleString()}</p>
           <br>
           <p>Please log in to your dashboard to get started.</p>
           <p>— Book Your Need</p>
@@ -953,7 +1010,6 @@ router.post("/accept-bid", async (req, res) => {
       console.log("✅ Email sent to assigned worker:", worker.email);
     }
 
-    // ✅ Notify customer
     if (customer?.email) {
       await sendEmailSafe({
         to: customer.email,
@@ -961,7 +1017,9 @@ router.post("/accept-bid", async (req, res) => {
         context: "Customer Notification",
         html: `
           <h2>Hi ${customer.name || "there"},</h2>
-          <p>You successfully assigned <strong>${worker.name || "the worker"}</strong> 
+          <p>You successfully assigned <strong>${
+            worker.name || "the worker"
+          }</strong> 
           to the job: <strong>${job.jobTitle}</strong>.</p>
           <p><strong>Accepted Bid:</strong> $${acceptedBid.price}</p>
           <br>
@@ -971,7 +1029,7 @@ router.post("/accept-bid", async (req, res) => {
       console.log("✅ Email sent to customer:", customer.email);
     }
 
-    // ✅ Notify rejected workers via email
+    // rejected emails (unchanged)
     const rejectedBids = await Bid.find({
       jobId,
       workerId: { $ne: workerId },
@@ -983,8 +1041,8 @@ router.post("/accept-bid", async (req, res) => {
       if (rejectedWorker?.email) {
         await sendEmailSafe({
           to: rejectedWorker.email,
-          context: `Rejected Worker ${rejectedWorker._id}`,
           subject: "🙁 You Weren’t Selected This Time",
+          context: `Rejected Worker ${rejectedWorker._id}`,
           html: `
             <h2>Hi ${rejectedWorker.name || "there"},</h2>
             <p>You placed a bid on the job: <strong>${job.jobTitle}</strong>, 
@@ -999,7 +1057,27 @@ router.post("/accept-bid", async (req, res) => {
       }
     }
 
-    res.status(200).json({ message: "Worker assigned successfully." });
+    // ============================================
+    // 🔥 FINAL RESPONSE — NOW RETURNS EVERYTHING
+    // ============================================
+    res.status(200).json({
+      message: "Worker assigned successfully.",
+      job,
+      workerDetails: {
+        id: worker._id,
+        name: worker.name,
+        phone: worker.phone,
+        email: worker.email,
+        photo: worker.profilePhotoUrl,
+      },
+      customerDetails: {
+        id: customer?._id,
+        name: customer?.name,
+        phone: customer?.phone,
+        email: customer?.email,
+        photo: customer?.profilePhotoUrl,
+      },
+    });
   } catch (err) {
     console.error("❌ Error accepting bid:", err);
     res.status(500).json({ message: "Server error" });

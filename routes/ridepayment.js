@@ -87,19 +87,24 @@ router.post("/create-intent", async (req, res) => {
 
 
 // =====================================================
-// ✅ 2️⃣ CONFIRM BOOKING (Mark Payment as CAPTURED)
+// ✅ 2️⃣ CONFIRM BOOKING (Mark Payment as CAPTURED) — FIXED FOR STOP LOGIC
 // =====================================================
 router.post("/confirm-booking", async (req, res) => {
   try {
     const {
       rideId,
       customerId,
-      from,
-      to,
+
+      // ⭐ NEW STOP-FRIENDLY FIELDS
+      segmentFrom,
+      segmentTo,
+      segmentPrice,
+
       message,
       paymentIntentId,
+
+      totalPaid,          // ⭐ includes booking fee (for Stripe only)
       seatsRequested = 1,
-      totalPrice,
     } = req.body;
 
     if (!rideId || !customerId || !paymentIntentId) {
@@ -113,12 +118,20 @@ router.post("/confirm-booking", async (req, res) => {
     const customer = await User.findById(customerId).select("name email");
     if (!customer) return res.status(404).json({ error: "Customer not found" });
 
-    // 💵 Price fallback logic
+    // =====================================================
+    // ⭐ FIGURE OUT CORRECT PRICE AND ROUTE
+    // =====================================================
     const seatPrice = Number(ride.pricePerSeat) || 0;
-    const computedPrice = seatPrice * seatsRequested;
-    const finalPrice = Number(totalPrice) || computedPrice;
 
-    // 💳 Retrieve payment intent to confirm it was captured
+    // If segmentPrice exists → stop booking
+    const finalSegmentPrice = Number(segmentPrice) || seatPrice;
+
+    const finalFrom = segmentFrom || ride.from;
+    const finalTo = segmentTo || ride.to;
+
+    // =====================================================
+    // 💳 Validate payment intent success
+    // =====================================================
     const intent = await stripe.paymentIntents.retrieve(paymentIntentId);
 
     if (intent.status !== "succeeded") {
@@ -127,30 +140,42 @@ router.post("/confirm-booking", async (req, res) => {
       });
     }
 
-    // 💾 Create/update booking request
+    // =====================================================
+    // 💾 SAVE BOOKING WITH STOP-LOGIC FIELDS
+    // =====================================================
     const booking = await BookingRequest.findOneAndUpdate(
       { rideId, customerId },
       {
         $set: {
           rideId,
           customerId,
-          from,
-          to,
+
+          // ⭐ Correct route
+          from: finalFrom,
+          to: finalTo,
+
+          // ⭐ Correct rider price (NO booking fee)
+          price: finalSegmentPrice,
+          segmentPrice: finalSegmentPrice,
+
+          // ⭐ Stripe total (with booking fee)
+          totalPaid: Number(totalPaid) || finalSegmentPrice,
+
           seatsRequested,
-          price: finalPrice,
-          totalPrice: finalPrice,
-          finalPrice: finalPrice,
           message,
           paymentIntentId,
-          paymentStatus: "captured",   // 🔥 NEW
-          requestStatus: "pending",    // waiting for driver
+
+          paymentStatus: "captured",
+          requestStatus: "pending",
           updatedAt: new Date(),
         },
       },
       { upsert: true, new: true }
     );
 
-    // ⚡ SOCKET + EMAIL
+    // =====================================================
+    // SOCKET + EMAIL PAYLOAD
+    // =====================================================
     const io = req.app.get("socketio");
     const { sendRideEmail } = require("../emailService");
 
@@ -161,13 +186,15 @@ router.post("/confirm-booking", async (req, res) => {
       customerName: customer.name,
       driverId: ride.workerId?._id,
       driverName: ride.workerId?.name,
-      from,
-      to,
-      pricePerSeat: seatPrice,
+
+      from: finalFrom,
+      to: finalTo,
+
+      price: finalSegmentPrice,
+      segmentPrice: finalSegmentPrice,
+      totalPaid,
+
       seatsRequested,
-      total: finalPrice,
-      totalPrice: finalPrice,
-      finalPrice: finalPrice,
       date: ride.date,
       time: ride.time,
       message,
@@ -176,7 +203,7 @@ router.post("/confirm-booking", async (req, res) => {
       updatedAt: booking.updatedAt,
     };
 
-    // Notify rooms
+    // Notify sockets
     io.to(`ride_${rideId}`).emit("ride-request:new", payload);
     if (ride.workerId?._id)
       io.to(`ride_driver_${ride.workerId._id}`).emit("ride-request:driver", payload);
@@ -188,8 +215,8 @@ router.post("/confirm-booking", async (req, res) => {
         to: ride.workerId.email,
         customerName: customer.name,
         driverName: ride.workerId.name,
-        from,
-        toLocation: to,
+        from: finalFrom,
+        toLocation: finalTo,
         date: ride.date,
         time: ride.time,
       });
@@ -1102,70 +1129,75 @@ router.post("/customer-complete", async (req, res) => {
     }
 
     // =====================================================
-    // 3️⃣ PAYOUT LOGIC (INTERNAL WALLET)
-    //     Only when BOTH driver + customer completed
-    // =====================================================
-    let payoutSuccess = false;
+// 3️⃣ PAYOUT LOGIC (INTERNAL WALLET)
+//     Only when BOTH driver + customer completed
+// =====================================================
+let payoutSuccess = false;
 
-    if (
-      booking.driverComplete &&
-      booking.customerComplete &&
-      !booking.driverPaid
-    ) {
-      console.log(
-        "💰 Releasing payout to driver wallet for booking:",
-        bookingId
-      );
+if (
+  booking.driverComplete &&
+  booking.customerComplete &&
+  !booking.driverPaid
+) {
+  console.log("💰 Releasing payout to driver wallet for booking:", bookingId);
 
-      const amount = Number(booking.finalPrice) || 0;
+  // ⭐ FIXED — use ONLY segmentPrice, NOT totalPaid
+  const amount = Number(booking.segmentPrice) || 0;
 
-      // Commission rules (same as you had)
-      let commission = 0.0445; // 4.45% base
-      const previousEarnings = driver.totalEarnings || 0;
+  // NO BOOKING FEE GOES TO DRIVER — EVER
+  if (amount <= 0) {
+    console.error("❌ Segment price missing — payout aborted");
+    return res.status(400).json({ error: "Invalid segment price" });
+  }
 
-      if (previousEarnings >= 100 && previousEarnings < 300) {
-        commission = 0.05;
-      }
+  // Commission logic
+  let commission = 0.0445; // 4.45% base
+  const previousEarnings = driver.totalEarnings || 0;
 
-      if (previousEarnings >= 300 && amount > 0) {
-        commission = 20 / amount; // flat $20 cap
-      }
+  if (previousEarnings >= 100 && previousEarnings < 300) {
+    commission = 0.05;
+  }
 
-      const payout =
-        commission >= 1
-          ? amount - 20
-          : parseFloat((amount * (1 - commission)).toFixed(2));
+  if (previousEarnings >= 300 && amount > 0) {
+    commission = 20 / amount; // flat $20 cap
+  }
 
-      // 💼 Update driver wallet
-      driver.walletBalance = (driver.walletBalance || 0) + payout;
+  // Final worker payout
+  const payout =
+    commission >= 1
+      ? amount - 20
+      : parseFloat((amount * (1 - commission)).toFixed(2));
 
-      driver.walletHistory.push({
-        type: "credit",
-        amount: payout,
-        bookingId: booking._id,
-        date: new Date(),
-        released: true,
-        notes: `Ride payout. Base: $${amount}, Commission: ${
-          commission >= 1 ? "$20 flat" : (commission * 100).toFixed(2) + "%"
-        }.`,
-      });
+  // Wallet updates
+  driver.walletBalance = (driver.walletBalance || 0) + payout;
 
-      driver.totalEarnings = (driver.totalEarnings || 0) + payout;
-      await driver.save();
+  driver.walletHistory.push({
+    type: "credit",
+    amount: payout,
+    bookingId: booking._id,
+    date: new Date(),
+    released: true,
+    notes: `Ride payout. Base: $${amount}, Commission: ${
+      commission >= 1 ? "$20 flat" : (commission * 100).toFixed(2) + "%"
+    }.`,
+  });
 
-      // Mark booking as paid out
-      booking.driverPaid = true;
-      booking.paidOutAt = new Date();
-      booking.payoutStatus = "paid";
-      await booking.save();
+  driver.totalEarnings = (driver.totalEarnings || 0) + payout;
+  await driver.save();
 
-      // Live wallet update to driver
-      io.to(`ride_driver_${driver._id}`).emit("wallet:update", {
-        walletBalance: driver.walletBalance,
-      });
+  // Mark booking as paid
+  booking.driverPaid = true;
+  booking.paidOutAt = new Date();
+  booking.payoutStatus = "paid";
+  await booking.save();
 
-      payoutSuccess = true;
-    }
+  // Live update
+  io.to(`ride_driver_${driver._id}`).emit("wallet:update", {
+    walletBalance: driver.walletBalance,
+  });
+
+  payoutSuccess = true;
+}
 
     // =====================================================
     // 4️⃣ IF ALL BOOKINGS ARE DONE → CLOSE THE RIDE

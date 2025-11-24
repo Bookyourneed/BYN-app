@@ -93,7 +93,7 @@ app.use("/api/ridepayment", require("./routes/ridepayment"));
 app.use("/api/ride-booking", require("./routes/customerridebooking"));
 app.use("/api/notification", require("./routes/notification"));
 app.use("/api/worker/job", require("./routes/workerJobs"));
-
+app.use("/api/chat", require("./routes/chatUpload"));
 // ✅ Payment & Wallet Routes
 app.use("/api/payment", require("./routes/payment"));
 app.use("/api/worker", require("./routes/workerWallet"));
