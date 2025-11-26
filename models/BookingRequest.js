@@ -15,21 +15,41 @@ const BookingRequestSchema = new mongoose.Schema(
       required: true,
     },
 
-    from: String,
+    /* =====================================================
+       📍 ROUTE INFO (Supports STOP logic)
+    ===================================================== */
+    from: String,           // for normal rides
     to: String,
     message: String,
 
+    // ⭐ NEW STOP FIELDS
+    segmentFrom: { type: String, default: null },
+    segmentTo: { type: String, default: null },
+    segmentPrice: { type: Number, default: null },
+    isStop: { type: Boolean, default: false },
+
+    /* =====================================================
+       🧍 Seats
+    ===================================================== */
     seatsRequested: {
       type: Number,
       default: 1,
     },
 
-    /* 🔥 PRICE FIELDS */
-    price: Number,
-    totalPrice: Number,
-    finalPrice: Number,
+    /* =====================================================
+       💵 PRICE FIELDS
+       price = the rider-price (seat or stop)
+    ===================================================== */
+    price: Number,          // rider price
+    totalPrice: Number,     // old field (keep for compatibility)
+    finalPrice: Number,     // old field (safe to keep)
 
-    /* 🔥 PAYMENT */
+    // ⭐ NEW (used in backend confirm-booking)
+    totalPaid: { type: Number, default: 0 },   // includes booking fee
+
+    /* =====================================================
+       💳 PAYMENT
+    ===================================================== */
     paymentIntentId: String,
     paymentStatus: {
       type: String,
@@ -47,7 +67,9 @@ const BookingRequestSchema = new mongoose.Schema(
     paidOutAt: { type: Date },
     refundedAt: { type: Date },
 
-    /* 🔥 STATUS */
+    /* =====================================================
+       🚦 REQUEST STATUS
+    ===================================================== */
     requestStatus: {
       type: String,
       enum: [
@@ -63,7 +85,9 @@ const BookingRequestSchema = new mongoose.Schema(
       default: "pending",
     },
 
-    /* 🔥 COMPLETION */
+    /* =====================================================
+       🎉 COMPLETION LOGIC
+    ===================================================== */
     driverComplete: { type: Boolean, default: false },
     customerComplete: { type: Boolean, default: false },
 
@@ -72,12 +96,16 @@ const BookingRequestSchema = new mongoose.Schema(
 
     acceptedAt: { type: Date },
 
-    /* 🔥 DISPUTES */
+    /* =====================================================
+       ⚠️ DISPUTES
+    ===================================================== */
     disputedBy: { type: String, enum: ["customer", "worker", null], default: null },
     disputeReason: { type: String },
     disputedAt: { type: Date },
 
-    /* 🔥 CLEANUP */
+    /* =====================================================
+       🧹 CLEANUP / ARCHIVE
+    ===================================================== */
     archived: { type: Boolean, default: false },
 
     updatedAt: { type: Date, default: Date.now },
@@ -91,4 +119,3 @@ BookingRequestSchema.pre("save", function (next) {
 });
 
 module.exports = mongoose.model("BookingRequest", BookingRequestSchema);
-
