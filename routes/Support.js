@@ -9,6 +9,36 @@ const { sendSupportEmail } = require("../emailService");
 /* ------------------------------------------------------------------------- */
 /* 💬 LIVE CHAT SESSION SYSTEM                                               */
 /* ------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------- */
+/* 🎟️ WORKER SUPPORT TICKET (email only)                                     */
+/* ------------------------------------------------------------------------- */
+
+router.post("/send-worker-ticket", async (req, res) => {
+  const { subject, message, workerEmail, workerName } = req.body;
+
+  try {
+    // Send to admin
+    await sendSupportEmail("supportTicketToAdmin", {
+      to: "donotreply@bookyourneed.com",
+      customerName: workerName || "Worker",
+      customerEmail: workerEmail,
+      subject,
+      message,
+    });
+
+    // Confirmation to worker
+    await sendSupportEmail("supportTicketConfirmation", {
+      to: workerEmail,
+      customerName: workerName || "Worker",
+      subject,
+    });
+
+    res.status(200).json({ success: true, message: "Worker ticket submitted" });
+  } catch (err) {
+    console.error("❌ send-worker-ticket error:", err);
+    res.status(500).json({ message: "Failed to send worker ticket" });
+  }
+});
 
 // ✅ Start new support chat session
 router.post("/start-session", async (req, res) => {
