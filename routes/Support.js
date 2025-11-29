@@ -9,15 +9,26 @@ const { sendSupportEmail } = require("../emailService");
 /* ------------------------------------------------------------------------- */
 /* 💬 LIVE CHAT SESSION SYSTEM                                               */
 /* ------------------------------------------------------------------------- */
-/* ------------------------------------------------------------------------- */
-/* 🎟️ WORKER SUPPORT TICKET (email only)                                     */
-/* ------------------------------------------------------------------------- */
 
 router.post("/send-worker-ticket", async (req, res) => {
   const { subject, message, workerEmail, workerName } = req.body;
 
+  if (!workerEmail) {
+    return res.status(400).json({ error: "Worker email missing" });
+  }
+
   try {
-    // Send to admin
+    // 1️⃣ SAVE TICKET IN DATABASE
+    const ticket = await SupportTicket.create({
+      name: workerName || "Worker",
+      email: workerEmail,
+      subject,
+      message,
+      type: "worker", // <-- NEW FIELD
+      createdAt: new Date(),
+    });
+
+    // 2️⃣ SEND EMAIL TO ADMIN
     await sendSupportEmail("supportTicketToAdmin", {
       to: "donotreply@bookyourneed.com",
       customerName: workerName || "Worker",
@@ -26,17 +37,21 @@ router.post("/send-worker-ticket", async (req, res) => {
       message,
     });
 
-    // Confirmation to worker
+    // 3️⃣ SEND CONFIRMATION TO WORKER
     await sendSupportEmail("supportTicketConfirmation", {
       to: workerEmail,
       customerName: workerName || "Worker",
       subject,
     });
 
-    res.status(200).json({ success: true, message: "Worker ticket submitted" });
+    return res.status(200).json({
+      success: true,
+      message: "Worker ticket saved & emailed",
+      ticket,
+    });
   } catch (err) {
     console.error("❌ send-worker-ticket error:", err);
-    res.status(500).json({ message: "Failed to send worker ticket" });
+    res.status(500).json({ error: "Failed to submit worker ticket" });
   }
 });
 
