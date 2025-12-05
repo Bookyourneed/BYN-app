@@ -45,18 +45,35 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 
 // =====================================================
-// 🌐 CORS — allow only live domains
+// 🌐 CORS — allow live domains + mobile apps
 // =====================================================
+const allowedOrigins = [
+  "https://bookyourneed.com",
+  "https://worker.bookyourneed.com",
+  "https://admin.bookyourneed.com",
+  "https://api.bookyourneed.com",
+  "https://app.bookyourneed.com",
+
+  // Mobile App Origins
+  "capacitor://localhost",
+  "ionic://localhost",
+  "http://localhost",
+  "https://localhost"
+];
+
 app.use(
   cors({
-    origin: [
-      "https://bookyourneed.com",
-      "https://worker.bookyourneed.com",
-      "https://admin.bookyourneed.com",
-      "https://api.bookyourneed.com",
-      "https://app.bookyourneed.com",
-      "http://localhost:3000", // for local testing
-    ],
+    origin: function (origin, callback) {
+      // Allow requests with no origin (mobile apps, Postman, etc.)
+      if (!origin) return callback(null, true);
+
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      } else {
+        console.log("❌ BLOCKED BY CORS:", origin);
+        return callback(new Error("Not allowed by CORS"));
+      }
+    },
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     credentials: true,
   })

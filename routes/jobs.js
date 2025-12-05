@@ -665,37 +665,6 @@ if (job.stripePaymentIntentId) {
   console.warn("⚠️ No stripePaymentIntentId for this job");
 }
 //
-    // ✅ Process Stripe refund safely
-    if (job.stripePaymentIntentId) {
-      try {
-        const paymentIntent = await stripe.paymentIntents.retrieve(job.stripePaymentIntentId);
-        const charge = paymentIntent.latest_charge
-          ? await stripe.charges.retrieve(paymentIntent.latest_charge)
-          : null;
-
-        const paidAmount = charge ? charge.amount / 100 : 0;
-        const safeRefundAmount = Math.min(Number(refundAmount), paidAmount);
-
-        if (safeRefundAmount > 0) {
-          await stripe.refunds.create({
-            payment_intent: job.stripePaymentIntentId,
-            amount: Math.round(safeRefundAmount * 100),
-          });
-          console.log(`✅ Stripe refund processed: $${safeRefundAmount}`);
-        } else {
-          console.warn("⚠️ No refundable amount available:", job._id);
-        }
-      } catch (stripeError) {
-        console.error("❌ Stripe refund failed:", stripeError);
-        return res.status(500).json({
-          message: "Stripe refund failed",
-          details: stripeError.message,
-        });
-      }
-    } else {
-      console.warn("⚠️ No stripePaymentIntentId for this job");
-    }
-//
 
     // ✅ Update DB (use findByIdAndUpdate since we used lean)
     const updatedJob = await Job.findByIdAndUpdate(
