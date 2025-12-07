@@ -544,11 +544,17 @@ router.get('/job/:jobId', async (req, res) => {
   }
 });
 
-// ✅ REAL Stripe Refund + Worker Payout on Dispute Resolution
+// ✅ REAL Stripe Refund + Worker Payout on Dispute Resolution 
 router.post("/resolve-dispute/:jobId", async (req, res) => {
   const { jobId } = req.params;
-  const { resolution, refundAmount, adminNotes } = req.body;
-  // resolution: "refund_customer" | "release_worker" | "partial_refund"
+
+  // New fields from frontend
+  const {
+    resolution,
+    refundAmount,      // old customer refund field
+    workerAmount,      // new worker amount field
+    adminNotes,
+  } = req.body;
 
   try {
     const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
@@ -563,6 +569,7 @@ router.post("/resolve-dispute/:jobId", async (req, res) => {
     if (job.status !== "dispute")
       return res.status(400).json({ error: "Job is not under dispute" });
 
+    // Update payment info
     job.paymentInfo = job.paymentInfo || {};
     job.paymentInfo.escrowStatus = "resolved";
     job.paymentInfo.lastActionAt = new Date();
@@ -579,33 +586,33 @@ router.post("/resolve-dispute/:jobId", async (req, res) => {
     let customerEmailMsg = "";
 
     /* ================================================================
-       🧾 REAL STRIPE REFUND LOGIC
+       🧾 STRIPE REFUND HELPER
     ================================================================ */
     const processStripeRefund = async (amount) => {
       if (!job.stripePaymentIntentId) {
-        console.warn("⚠️ No Stripe PaymentIntent found for job:", jobId);
+        console.warn("⚠️ No PaymentIntent found");
         return false;
       }
 
       try {
-        const paymentIntent = await stripe.paymentIntents.retrieve(job.stripePaymentIntentId);
+        const paymentIntent = await stripe.paymentIntents.retrieve(
+          job.stripePaymentIntentId
+        );
         const charge = paymentIntent.latest_charge
           ? await stripe.charges.retrieve(paymentIntent.latest_charge)
           : null;
+
         const paidAmount = charge ? charge.amount / 100 : 0;
         const safeRefund = Math.min(Number(amount), paidAmount);
 
-        if (safeRefund <= 0) {
-          console.warn("⚠️ No refundable amount.");
-          return false;
-        }
+        if (safeRefund <= 0) return false;
 
         await stripe.refunds.create({
           payment_intent: job.stripePaymentIntentId,
           amount: Math.round(safeRefund * 100),
         });
 
-        console.log(`✅ Stripe refund processed: $${safeRefund}`);
+        console.log(`💸 Stripe refund processed: $${safeRefund}`);
         return true;
       } catch (err) {
         console.error("❌ Stripe refund failed:", err);
@@ -614,87 +621,117 @@ router.post("/resolve-dispute/:jobId", async (req, res) => {
     };
 
     /* ================================================================
-       💰 Worker Payout Function
+       💰 WORKER PAYMENT HELPER
     ================================================================ */
-    const releaseToWorker = async () => {
+    const creditWorker = async (amount) => {
+      if (!job.assignedTo) return;
+
       const worker = await Worker.findById(job.assignedTo);
       if (!worker) return;
 
-      const commission = worker.commissionRate || 0.15;
-      const earning = parseFloat((job.assignedPrice * (1 - commission)).toFixed(2));
+      worker.walletBalance = (worker.walletBalance || 0) + Number(amount);
 
-      worker.walletBalance = (worker.walletBalance || 0) + earning;
       worker.walletHistory.push({
         type: "credit",
-        amount: earning,
+        amount: Number(amount),
         jobId: job._id,
         date: new Date(),
         released: true,
-        notes: "Released after dispute resolution",
+        notes: "Partial dispute payout",
       });
 
       await worker.save();
-      console.log(`💸 Released $${earning} to worker ${worker.name}`);
+      console.log(`💼 Worker credited: $${amount}`);
     };
 
     /* ================================================================
-       🧾 Handle Different Resolution Types
+       🎯 RESOLUTION OPTIONS
     ================================================================ */
+
+    // ⚠️ Full refund to customer (unchanged)
     if (resolution === "refund_customer") {
-      const refundTotal = job.budget || job.assignedPrice || 0;
-      await processStripeRefund(refundTotal);
+      const totalRefund = job.budget || job.assignedPrice || 0;
+      await processStripeRefund(totalRefund);
 
       job.paymentStatus = "refunded";
-      job.refundAmount = refundTotal;
       job.status = "cancelled";
-      resolutionMessage = `✅ Full refund issued to customer ($${refundTotal}).`;
+      job.refundAmount = totalRefund;
 
-      workerEmailMsg = `The job "${job.jobTitle}" dispute was resolved in favor of the customer. The payment will not be released.`;
-      customerEmailMsg = `Your dispute for job "${job.jobTitle}" was resolved in your favor. A refund of $${refundTotal} has been processed.`;
+      resolutionMessage = `💸 Full refund of $${totalRefund} issued.`;
+      workerEmailMsg = `Admin resolved the dispute in favor of the customer. No payout released.`;
+      customerEmailMsg = `Your full refund of $${totalRefund} has been processed.`;
     }
 
+    // ⭐ NEW PARTIAL REFUND SYSTEM
     if (resolution === "partial_refund") {
-      const partial = Number(refundAmount) || 0;
-      await processStripeRefund(partial);
+      const customerShare = Math.max(Number(refundAmount) || 0, 0);
+      const workerShare = Math.max(Number(workerAmount) || 0, 0);
+
+      // Refund customer (real money)
+      if (customerShare > 0) {
+        await processStripeRefund(customerShare);
+      }
+
+      // Pay worker (wallet credit)
+      if (workerShare > 0) {
+        await creditWorker(workerShare);
+      }
 
       job.paymentStatus = "partial_refund";
-      job.refundAmount = partial;
-      resolutionMessage = `⚖️ Partial refund of $${partial} issued.`;
+      job.status = "completed";
+      job.refundAmount = customerShare;
+      job.partialWorkerAmount = workerShare;
 
-      workerEmailMsg = `The dispute for job "${job.jobTitle}" was partially refunded to the customer.`;
-      customerEmailMsg = `A partial refund of $${partial} has been processed for your dispute on "${job.jobTitle}".`;
+      resolutionMessage = `⚖️ Partial refund: $${customerShare} to customer, $${workerShare} to worker.`;
+
+      workerEmailMsg = `You received $${workerShare} from dispute resolution.`;
+      customerEmailMsg = `You received a partial refund of $${customerShare}.`;
     }
 
+    // 🟢 Release full amount to worker (unchanged)
     if (resolution === "release_worker") {
-      await releaseToWorker();
+      const worker = await Worker.findById(job.assignedTo);
+      if (worker) {
+        const commission = worker.commissionRate || 0.15;
+        const earning = parseFloat(
+          (job.assignedPrice * (1 - commission)).toFixed(2)
+        );
+
+        await creditWorker(earning);
+      }
 
       job.paymentStatus = "released";
       job.status = "completed";
-      resolutionMessage = `💰 Payment released to worker ($${job.assignedPrice}).`;
 
-      workerEmailMsg = `The dispute for job "${job.jobTitle}" was resolved in your favor. Your payment has been released.`;
-      customerEmailMsg = `Your dispute for job "${job.jobTitle}" was resolved in favor of the worker. Funds have been released.`;
+      resolutionMessage = `💰 Full payout released to worker.`;
+      workerEmailMsg = `Your full payment has been released for "${job.jobTitle}".`;
+      customerEmailMsg = `The dispute was resolved in favor of the worker.`;
     }
 
     await job.save();
 
     /* ================================================================
-       📡 SOCKET + EMAIL NOTIFICATIONS
+       📡 REAL-TIME SOCKET EVENTS
     ================================================================ */
-    if (job.customerId?.email)
+    if (job.customerId?.email) {
       io.to(`customer_${job.customerId.email}`).emit("job:update", {
         jobId: job._id,
         status: job.status,
         message: resolutionMessage,
       });
+    }
 
-    if (job.assignedTo?._id)
+    if (job.assignedTo?._id) {
       io.to(`worker_${job.assignedTo._id}`).emit("job:update", {
         jobId: job._id,
         status: job.status,
         message: resolutionMessage,
       });
+    }
 
+    /* ================================================================
+       ✉️ EMAILS
+    ================================================================ */
     if (job.assignedTo?.email) {
       await sendEmailSafe({
         to: job.assignedTo.email,
@@ -731,6 +768,7 @@ router.post("/resolve-dispute/:jobId", async (req, res) => {
     res.status(500).json({ error: err.message || "Failed to resolve dispute" });
   }
 });
+
 
 // ✅ Get all active disputes
 router.get("/all-disputes", async (req, res) => {
