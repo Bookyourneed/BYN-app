@@ -595,121 +595,170 @@ router.get("/bids/changes/:email", async (req, res) => {
 
 
 
-// ✅ Cancel Job and Refund (now with socket emit)
+// ============================================================
+// ✅ CANCEL JOB & REFUND (correct logic + cancellation fee)
+// ============================================================
 router.post("/cancel-job/:jobId", async (req, res) => {
   const { jobId } = req.params;
-  const io = getIO(); // ✅ initialize socket connection
+  const io = getIO(); // socket.io
 
   try {
+    // ------------------------------------------------------------
+    // 1️⃣ Fetch Job
+    // ------------------------------------------------------------
     const job = await Job.findById(jobId)
       .populate("customerId assignedTo")
       .lean({ virtuals: true });
 
-    if (!job) return res.status(404).json({ message: "Job not found" });
+    if (!job) {
+      return res.status(404).json({ message: "Job not found" });
+    }
 
     const wasAssigned =
-      job.status === "assigned" || (job.status === "reopened" && job.assignedTo);
+      job.status === "assigned" ||
+      (job.status === "reopened" && job.assignedTo);
+
     const wasReopenedUnassigned =
       job.status === "reopened" && !job.assignedTo;
 
+    // ------------------------------------------------------------
+    // 2️⃣ Get actual Stripe captured amount (this is the ONLY number we use)
+    // ------------------------------------------------------------
+    let capturedAmount = 0;
+
+    if (job.stripePaymentIntentId) {
+      try {
+        const paymentIntent = await stripe.paymentIntents.retrieve(
+          job.stripePaymentIntentId
+        );
+
+        const charge = paymentIntent.latest_charge
+          ? await stripe.charges.retrieve(paymentIntent.latest_charge)
+          : null;
+
+        capturedAmount = charge ? charge.amount / 100 : 0; // convert cents → CAD
+      } catch (err) {
+        console.error("❌ Failed to retrieve Stripe payment:", err);
+        return res.status(500).json({
+          message: "Failed to retrieve Stripe payment details",
+          details: err.message,
+        });
+      }
+    } else {
+      console.warn("⚠️ No stripePaymentIntentId found for this job.");
+    }
+
+    // ------------------------------------------------------------
+    // 3️⃣ Determine refund amount (using ONLY capturedAmount)
+    // ------------------------------------------------------------
     let refundAmount = 0;
 
-    // ✅ Determine refund amount
-    if (wasAssigned) {
-      refundAmount = job.assignedPrice
-        ? Math.max(Number(job.assignedPrice) - 4.99, 0)
-        : 0;
+    // No worker → full refund
+    if (job.status === "pending" || wasReopenedUnassigned) {
+      refundAmount = capturedAmount;
+      job.paymentStatus = "refunded";
+      job.cancellationFee = 0;
+    }
+
+    // Worker assigned → refund captured - 4.99
+    else if (wasAssigned) {
+      refundAmount = Math.max(capturedAmount - 4.99, 0);
       job.paymentStatus = "partial_refund";
       job.cancellationFee = 4.99;
-    } else if (job.status === "pending" || wasReopenedUnassigned) {
-      refundAmount = Number(job.assignedPrice || job.budget || 0);
-      job.paymentStatus = "refunded";
-    } else {
-      return res
-        .status(400)
-        .json({ message: "Job cannot be cancelled in current state." });
     }
 
-//
-// ✅ Process Stripe refund safely (with 4.99 deduction logic)
-if (job.stripePaymentIntentId) {
-  try {
-    const paymentIntent = await stripe.paymentIntents.retrieve(job.stripePaymentIntentId);
-    const charge = paymentIntent.latest_charge
-      ? await stripe.charges.retrieve(paymentIntent.latest_charge)
-      : null;
-
-    const paidAmount = charge ? charge.amount / 100 : 0; // in CAD dollars
-
-    // Ensure we have a valid refund amount (never more than paid)
-    const refundToIssue = Math.min(refundAmount, paidAmount);
-
-    if (refundToIssue > 0) {
-      await stripe.refunds.create({
-        payment_intent: job.stripePaymentIntentId,
-        amount: Math.round(refundToIssue * 100), // in cents
-        reason: "requested_by_customer",
+    // Job cannot be cancelled
+    else {
+      return res.status(400).json({
+        message: "Job cannot be cancelled in the current state.",
       });
-      console.log(`💸 Stripe refund processed: $${refundToIssue.toFixed(2)}`);
-    } else {
-      console.warn(`⚠️ No refundable amount available for job ${job._id}`);
     }
-  } catch (err) {
-    console.error("❌ Stripe refund failed:", err);
-    return res.status(500).json({
-      message: "Stripe refund failed",
-      details: err.message,
-    });
-  }
-} else {
-  console.warn("⚠️ No stripePaymentIntentId for this job");
-}
-//
 
-    // ✅ Update DB (use findByIdAndUpdate since we used lean)
+    console.log(
+      `🔍 Captured: ${capturedAmount}, Refund: ${refundAmount}, Fee: ${job.cancellationFee}`
+    );
+
+    // ------------------------------------------------------------
+    // 4️⃣ Stripe Refund
+    // ------------------------------------------------------------
+    if (job.stripePaymentIntentId && refundAmount > 0) {
+      try {
+        await stripe.refunds.create({
+          payment_intent: job.stripePaymentIntentId,
+          amount: Math.round(refundAmount * 100), // convert to cents
+          reason: "requested_by_customer",
+        });
+
+        console.log(
+          `💸 Stripe refund processed successfully: $${refundAmount.toFixed(2)}`
+        );
+      } catch (err) {
+        console.error("❌ Stripe refund failed:", err);
+        return res.status(500).json({
+          message: "Stripe refund failed",
+          details: err.message,
+        });
+      }
+    } else {
+      console.warn(
+        `⚠️ No refund issued (refundAmount = ${refundAmount}, no paymentIntent)`
+      );
+    }
+
+    // ------------------------------------------------------------
+    // 5️⃣ Update Job in DB
+    // ------------------------------------------------------------
     const updatedJob = await Job.findByIdAndUpdate(
       jobId,
       {
         status: "cancelled",
         cancelledAt: new Date(),
-        refundAmount: Number(refundAmount),
+        refundAmount,
         paymentStatus: job.paymentStatus,
-        cancellationFee: job.cancellationFee || 0,
+        cancellationFee: job.cancellationFee,
       },
       { new: true }
     ).populate("customerId assignedTo");
 
-    // ✅ Socket Emit (real-time cancellation update)
+    // ------------------------------------------------------------
+    // 6️⃣ Socket Events
+    // ------------------------------------------------------------
     if (updatedJob.assignedTo?._id) {
       io.to(`worker_${updatedJob.assignedTo._id}`).emit("job:update", {
         jobId: updatedJob._id,
         status: "cancelled_by_customer",
       });
-      console.log(`📡 Sent job:update → worker_${updatedJob.assignedTo._id} (cancelled_by_customer)`);
+      console.log(
+        `📡 Emitted job:update → worker_${updatedJob.assignedTo._id}`
+      );
     }
 
-    if (updatedJob.customerId?._id) {
+    if (updatedJob.customerId?.email) {
       io.to(`customer_${updatedJob.customerId.email}`).emit("job:update", {
         jobId: updatedJob._id,
         status: "cancelled_by_customer",
       });
     }
 
-    // ✅ Notify worker by email
+    // ------------------------------------------------------------
+    // 7️⃣ Email Notifications
+    // ------------------------------------------------------------
+
+    // Worker email
     if (wasAssigned && updatedJob.assignedTo?.email) {
       await sendEmailSafe({
         to: updatedJob.assignedTo.email,
-        subject: "⚠️ Job Was Cancelled",
+        subject: "⚠️ Job Cancelled",
         html: `
           <h2>Hi ${updatedJob.assignedTo.name || "Worker"},</h2>
-          <p>The job <strong>${updatedJob.jobTitle}</strong> has been cancelled by the customer.</p>
+          <p>The job <strong>${updatedJob.jobTitle}</strong> was cancelled by the customer.</p>
           <p>The customer has been refunded.</p>
-          <br><p>— Book Your Need</p>
+          <p>— Book Your Need</p>
         `,
       });
     }
 
-    // ✅ Notify customer by email
+    // Customer email
     if (updatedJob.customerId?.email) {
       await sendEmailSafe({
         to: updatedJob.customerId.email,
@@ -717,16 +766,17 @@ if (job.stripePaymentIntentId) {
         html: `
           <h2>Hi ${updatedJob.customerId.name || "Customer"},</h2>
           <p>Your job <strong>${updatedJob.jobTitle}</strong> was cancelled successfully.</p>
-          <p>Refund amount: <strong>$${parseFloat(refundAmount || 0).toFixed(
-            2
-          )}</strong> has been processed to your payment method.</p>
-          <br><p>— Book Your Need</p>
+          <p>Refund issued: <strong>$${refundAmount.toFixed(2)}</strong></p>
+          <p>— Book Your Need</p>
         `,
       });
     }
 
+    // ------------------------------------------------------------
+    // 8️⃣ Success Response
+    // ------------------------------------------------------------
     res.status(200).json({
-      message: "Job cancelled and refund processed safely.",
+      message: "Job cancelled and refund processed successfully.",
       refundAmount,
     });
   } catch (err) {
