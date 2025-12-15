@@ -93,7 +93,7 @@ const Worker = require("./models/Worker");
 const Job = require("./models/Job");
 const Chat = require("./models/Chat");
 const BookingRequest = require("./models/BookingRequest");
-
+const workerPasswordReset = require("./routes/workerPasswordReset");
 // =====================================================
 // 🛣️ Routes
 // =====================================================
@@ -112,11 +112,13 @@ app.use("/api/notification", require("./routes/notification"));
 app.use("/api/worker/job", require("./routes/workerJobs"));
 app.use("/api/support", require("./routes/Support"));
 app.use("/api/chat", require("./routes/chatUpload"));
+app.use("/api/worker", workerPasswordReset);
 // ✅ Payment & Wallet Routes
 app.use("/api/payment", require("./routes/payment"));
 app.use("/api/worker", require("./routes/workerWallet"));
 app.use("/api/stripe", require("./routes/stripeConnect"));
-
+const passwordResetRoutes = require("./routes/passwordReset");
+app.use("/api/user", passwordResetRoutes);
 // =====================================================
 // 🖼️ Profile Picture Upload
 // =====================================================

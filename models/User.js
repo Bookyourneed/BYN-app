@@ -2,6 +2,9 @@ const mongoose = require("mongoose");
 
 const userSchema = new mongoose.Schema(
   {
+    // =========================
+    // 🔐 AUTH
+    // =========================
     email: {
       type: String,
       required: true,
@@ -9,61 +12,43 @@ const userSchema = new mongoose.Schema(
       lowercase: true,
       trim: true,
     },
+
     password: {
       type: String,
       default: null, // Optional for Google users
     },
+
     googleId: {
       type: String,
       default: null,
     },
+
+    // =========================
+    // 👤 BASIC PROFILE
+    // =========================
     name: {
       type: String,
       trim: true,
     },
+
     lastName: {
       type: String,
       trim: true,
     },
+
     profilePicture: {
       type: String,
       default: null,
     },
+
     profilePictureSkipped: {
       type: Boolean,
       default: false,
     },
+
     termsAccepted: {
       type: Boolean,
       default: false,
-    },
-    phone: {
-      type: String,
-      unique: true,
-      sparse: true,
-    },
-    address: {
-      type: String,
-      trim: true,
-    },
-    street: String,
-    city: String,
-    province: String,
-    postalCode: String,
-
-    // ✅ New Optional Fields
-    bio: {
-      type: String,
-      default: "",
-    },
-    hobbies: {
-      type: String,
-      default: "",
-    },
-    birthday: {
-      type: Date,
-      default: null,
-      immutable: true, // ❌ Cannot be changed after first set
     },
 
     profileCompleted: {
@@ -71,19 +56,111 @@ const userSchema = new mongoose.Schema(
       default: false,
     },
 
-    // ✅ Email Verification
+    // =========================
+    // 📞 PHONE VERIFICATION
+    // =========================
+    phone: {
+      type: String,
+      unique: true,
+      sparse: true, // Allows multiple null values
+    },
+
+    // =========================
+    // 🏠 ADDRESS
+    // =========================
+    address: {
+      type: String,
+      trim: true,
+    },
+
+    street: {
+      type: String,
+      trim: true,
+    },
+
+    city: {
+      type: String,
+      trim: true,
+    },
+
+    province: {
+      type: String,
+      trim: true,
+    },
+
+    postalCode: {
+      type: String,
+      trim: true,
+    },
+
+    latitude: {
+      type: Number,
+      default: null,
+    },
+
+    longitude: {
+      type: Number,
+      default: null,
+    },
+
+    // =========================
+    // 🧠 OPTIONAL PROFILE INFO
+    // =========================
+    bio: {
+      type: String,
+      default: "",
+    },
+
+    hobbies: {
+      type: String,
+      default: "",
+    },
+
+    birthday: {
+      type: Date,
+      default: null,
+      immutable: true, // ❌ Cannot be changed once set
+    },
+
+    // =========================
+    // ✉️ EMAIL VERIFICATION
+    // =========================
     emailVerified: {
       type: Boolean,
       default: false,
     },
-    emailOTP: String,
-    emailOTPExpires: Date,
 
-    // ✅ Stripe Customer Info
+    emailOTP: {
+      type: String,
+      default: null,
+    },
+
+    emailOTPExpires: {
+      type: Date,
+      default: null,
+    },
+
+    // =========================
+    // 🔁 PASSWORD RESET (EMAIL OTP)
+    // =========================
+    resetOtpHash: {
+      type: String,
+      default: null,
+    },
+
+    resetOtpExpires: {
+      type: Date,
+      default: null,
+    },
+
+    // =========================
+    // 💳 STRIPE
+    // =========================
     stripeCustomerId: {
       type: String,
       default: null,
     },
+
     cards: [
       {
         brand: String,
@@ -102,7 +179,9 @@ const userSchema = new mongoose.Schema(
       },
     ],
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+  }
 );
 
 module.exports = mongoose.model("User", userSchema);

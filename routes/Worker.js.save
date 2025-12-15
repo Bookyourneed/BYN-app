@@ -9,6 +9,49 @@ const Job = require('../models/Job');
 const Bid = require("../models/Bid");
 const jwt = require("jsonwebtoken");
 const SECRET_KEY = process.env.SECRET_KEY || "default_secret_key";
+// =======================================
+// 🔐 WORKER CHANGE PASSWORD (LOGGED IN)
+// =======================================
+router.post("/change-password", async (req, res) => {
+  try {
+    const { email, currentPassword, newPassword } = req.body;
+
+    if (!email || !currentPassword || !newPassword) {
+      return res.status(400).json({ message: "All fields are required." });
+    }
+
+    const worker = await Worker.findOne({ email });
+
+    if (!worker) {
+      return res.status(404).json({ message: "Worker not found." });
+    }
+
+    // 🚫 Google-only workers cannot change password
+    if (!worker.password) {
+      return res.status(400).json({
+        message: "This account uses Google Sign-In. Password change not allowed.",
+      });
+    }
+
+    // 🔍 Verify current password
+    const isMatch = await bcrypt.compare(currentPassword, worker.password);
+    if (!isMatch) {
+      return res.status(401).json({ message: "Current password is incorrect." });
+    }
+
+    // 🔐 Hash & save new password
+    const salt = await bcrypt.genSalt(10);
+    worker.password = await bcrypt.hash(newPassword, salt);
+    await worker.save();
+
+    console.log(`🔐 Worker password updated: ${worker.email}`);
+
+    res.json({ message: "Password updated successfully." });
+  } catch (error) {
+    console.error("❌ Worker change password error:", error);
+    res.status(500).json({ message: "Server error." });
+  }
+});
 
 const mongoose = require("mongoose");
 
@@ -925,49 +968,6 @@ router.get("/completed-jobs/:workerId", async (req, res) => {
   }
 });
 
-// =======================================
-// 🔐 WORKER CHANGE PASSWORD (LOGGED IN)
-// =======================================
-router.post("/change-password", async (req, res) => {
-  try {
-    const { email, currentPassword, newPassword } = req.body;
-
-    if (!email || !currentPassword || !newPassword) {
-      return res.status(400).json({ message: "All fields are required." });
-    }
-
-    const worker = await Worker.findOne({ email });
-
-    if (!worker) {
-      return res.status(404).json({ message: "Worker not found." });
-    }
-
-    // 🚫 Google-only workers cannot change password
-    if (!worker.password) {
-      return res.status(400).json({
-        message: "This account uses Google Sign-In. Password change not allowed.",
-      });
-    }
-
-    // 🔍 Verify current password
-    const isMatch = await bcrypt.compare(currentPassword, worker.password);
-    if (!isMatch) {
-      return res.status(401).json({ message: "Current password is incorrect." });
-    }
-
-    // 🔐 Hash & save new password
-    const salt = await bcrypt.genSalt(10);
-    worker.password = await bcrypt.hash(newPassword, salt);
-    await worker.save();
-
-    console.log(`🔐 Worker password updated: ${worker.email}`);
-
-    res.json({ message: "Password updated successfully." });
-  } catch (error) {
-    console.error("❌ Worker change password error:", error);
-    res.status(500).json({ message: "Server error." });
-  }
-});
 
 
 

@@ -6,7 +6,7 @@ const Job = require('../models/Job');
 const Worker = require('../models/Worker');
 const Ride = require("../models/Ride");
 const Bid = require("../models/Bid");
-
+const AdminEmail = require("../models/AdminEmail");
 const BookingRequest = require("../models/BookingRequest");
 
 // ✅ Stripe & dependencies
@@ -16,6 +16,37 @@ const { getIO } = require("../socket");
 const HelpTicket = require('../models/HelpTicket');
 const User = require('../models/User'); // Make sure this is defined
 const { sendEmailSafe } = require("../emailService");
+
+
+// ============================================================
+// 📡 ADMIN: GET ALL USERS (Customers + Workers)
+// ============================================================
+router.get("/all-users", async (req, res) => {
+  try {
+    const customers = await User.find({})
+      .select("name email phone city createdAt")
+      .lean();
+
+    const workers = await Worker.find({})
+      .select("name email phone city status tier createdAt")
+      .lean();
+
+    const formattedCustomers = customers.map((u) => ({
+      ...u,
+      role: "customer",
+    }));
+
+    const formattedWorkers = workers.map((u) => ({
+      ...u,
+      role: "worker",
+    }));
+
+    res.json([...formattedCustomers, ...formattedWorkers]);
+  } catch (err) {
+    console.error("❌ Fetch all users failed:", err);
+    res.status(500).json({ error: "Failed to fetch users" });
+  }
+});
 
 // ✅ In routes/admin.js or wherever admin routes are:
 router.get("/worker/:workerId", async (req, res) => {
@@ -247,14 +278,60 @@ router.post('/update-status/:workerId', async (req, res) => {
   }
 });
 
-// ✅ Get All Jobs
-router.get('/jobs', async (req, res) => {
+// ============================================================
+// ✅ ADMIN: GET ALL JOBS (rich list)
+// GET /api/admin/jobs
+// ============================================================
+router.get("/jobs", async (req, res) => {
   try {
-    const jobs = await Job.find().sort({ createdAt: -1 });
-    res.json(jobs);
+    const jobs = await Job.find()
+      .sort({ createdAt: -1 })
+      .populate("customerId", "name lastName email phone city province")
+      .populate("assignedTo", "name email phone")
+      .lean();
+
+    const formatted = jobs.map((j) => {
+      const custName = `${j.customerId?.name || ""} ${j.customerId?.lastName || ""}`.trim() || "N/A";
+      return {
+        ...j,
+        customerName: custName,
+        customerEmail: j.customerId?.email || "N/A",
+        customerPhone: j.customerId?.phone || "N/A",
+        city: j.customerId?.city || j.city || "N/A",
+        province: j.customerId?.province || j.province || "N/A",
+        workerName: j.assignedTo?.name || "N/A",
+        workerEmail: j.assignedTo?.email || "N/A",
+      };
+    });
+
+    res.json(formatted);
   } catch (err) {
-    console.error('Error fetching jobs:', err);
-    res.status(500).json({ message: 'Failed to fetch jobs' });
+    console.error("❌ Admin jobs error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+// ============================================================
+// ✅ ADMIN: GET ONE JOB (full details + bids)
+// GET /api/admin/jobs/:id
+// ============================================================
+router.get("/jobs/:id", async (req, res) => {
+  try {
+    const job = await Job.findById(req.params.id)
+      .populate("customerId", "name lastName email phone address street city province postalCode")
+      .populate("assignedTo", "name email phone")
+      .lean();
+
+    if (!job) return res.status(404).json({ error: "Job not found" });
+
+    const bids = await Bid.find({ jobId: job._id })
+      .sort({ createdAt: -1 })
+      .populate("workerId", "name email phone")
+      .lean();
+
+    res.json({ job, bids });
+  } catch (err) {
+    console.error("❌ Admin job detail error:", err);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
@@ -314,14 +391,98 @@ router.post('/help/update/:ticketId', async (req, res) => {
   }
 });
 
-// ✅ View Customers
-router.get('/customers', async (req, res) => {
+// ============================================================
+// ✅ ADMIN: GET ALL CUSTOMERS (with job stats)
+// GET /api/admin/customers
+// ============================================================
+router.get("/customers", async (req, res) => {
   try {
-    const users = await User.find().sort({ createdAt: -1 });
-    res.json(users);
+    const customers = await User.find()
+      .select("name lastName email phone street city province postalCode address createdAt profileCompleted emailVerified")
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const customerIds = customers.map((c) => c._id);
+
+    // Aggregate job stats per customer
+    const stats = await Job.aggregate([
+      { $match: { customerId: { $in: customerIds } } },
+      {
+        $group: {
+          _id: { customerId: "$customerId", status: "$status" },
+          count: { $sum: 1 },
+          lastJobAt: { $max: "$createdAt" },
+        },
+      },
+    ]);
+
+    // Build lookup: { customerId: { total, byStatus{} , lastJobAt } }
+    const lookup = {};
+    for (const row of stats) {
+      const id = String(row._id.customerId);
+      const status = row._id.status || "unknown";
+      if (!lookup[id]) lookup[id] = { total: 0, byStatus: {}, lastJobAt: null };
+      lookup[id].total += row.count;
+      lookup[id].byStatus[status] = row.count;
+
+      if (!lookup[id].lastJobAt || new Date(row.lastJobAt) > new Date(lookup[id].lastJobAt)) {
+        lookup[id].lastJobAt = row.lastJobAt;
+      }
+    }
+
+    const enriched = customers.map((c) => {
+      const id = String(c._id);
+      const fullName = `${c.name || ""} ${c.lastName || ""}`.trim() || "N/A";
+      const jobStats = lookup[id] || { total: 0, byStatus: {}, lastJobAt: null };
+
+      return {
+        ...c,
+        fullName,
+        jobCount: jobStats.total,
+        jobStats: jobStats.byStatus,
+        lastJobAt: jobStats.lastJobAt,
+      };
+    });
+
+    res.json(enriched);
   } catch (err) {
-    console.error('Failed to fetch customers:', err);
-    res.status(500).json({ message: 'Failed to load customers' });
+    console.error("❌ Admin customers error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+// ============================================================
+// ✅ ADMIN: GET ONE CUSTOMER (full details + jobs)
+// GET /api/admin/customers/:id
+// ============================================================
+router.get("/customers/:id", async (req, res) => {
+  try {
+    const customer = await User.findById(req.params.id).lean();
+    if (!customer) return res.status(404).json({ error: "Customer not found" });
+
+    const jobs = await Job.find({ customerId: customer._id })
+      .sort({ createdAt: -1 })
+      .select("jobTitle service status scheduledAt budget createdAt assignedTo completion history dispute")
+      .populate("assignedTo", "name email phone")
+      .lean();
+
+    // quick stats
+    const stats = jobs.reduce(
+      (acc, j) => {
+        acc.total++;
+        acc.byStatus[j.status] = (acc.byStatus[j.status] || 0) + 1;
+        return acc;
+      },
+      { total: 0, byStatus: {} }
+    );
+
+    res.json({
+      customer,
+      jobs,
+      stats,
+    });
+  } catch (err) {
+    console.error("❌ Admin customer detail error:", err);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
@@ -544,15 +705,14 @@ router.get('/job/:jobId', async (req, res) => {
   }
 });
 
-// ✅ REAL Stripe Refund + Worker Payout on Dispute Resolution 
+// ✅ REAL Stripe Refund + Worker Payout on Dispute Resolution (SAFE)
 router.post("/resolve-dispute/:jobId", async (req, res) => {
   const { jobId } = req.params;
 
-  // New fields from frontend
   const {
-    resolution,
-    refundAmount,      // old customer refund field
-    workerAmount,      // new worker amount field
+    resolution,        // refund_customer | partial_refund | release_worker
+    refundAmount = 0,  // customer refund
+    workerAmount = 0,  // worker payout
     adminNotes,
   } = req.body;
 
@@ -563,70 +723,67 @@ router.post("/resolve-dispute/:jobId", async (req, res) => {
 
     const job = await Job.findById(jobId)
       .populate("customerId", "email name")
-      .populate("assignedTo", "email name walletBalance commissionRate");
+      .populate("assignedTo", "email name commissionRate");
 
     if (!job) return res.status(404).json({ error: "Job not found" });
-    if (job.status !== "dispute")
+    if (job.status !== "dispute") {
       return res.status(400).json({ error: "Job is not under dispute" });
+    }
 
-    // Update payment info
-    job.paymentInfo = job.paymentInfo || {};
-    job.paymentInfo.escrowStatus = "resolved";
-    job.paymentInfo.lastActionAt = new Date();
+    /* ============================================================
+       🔐 GET REAL CUSTOMER PAID AMOUNT (SOURCE OF TRUTH)
+    ============================================================ */
+    let customerPaidAmount = 0;
 
-    job.history.push({
-      action: "dispute_resolved",
-      by: "admin",
-      at: new Date(),
-      notes: adminNotes || `Admin marked resolved: ${resolution}`,
-    });
+    if (job.stripePaymentIntentId) {
+      const pi = await stripe.paymentIntents.retrieve(
+        job.stripePaymentIntentId
+      );
+      if (pi?.latest_charge) {
+        const charge = await stripe.charges.retrieve(pi.latest_charge);
+        customerPaidAmount = charge.amount / 100;
+      }
+    }
 
-    let resolutionMessage = "";
-    let workerEmailMsg = "";
-    let customerEmailMsg = "";
+    if (customerPaidAmount <= 0) {
+      return res.status(400).json({
+        error: "Unable to determine customer payment amount",
+      });
+    }
 
-    /* ================================================================
+    /* ============================================================
+       🚫 HARD SAFETY CHECK — NEVER EXCEED PAID AMOUNT
+    ============================================================ */
+    if (
+      resolution === "partial_refund" &&
+      Number(refundAmount) + Number(workerAmount) > customerPaidAmount
+    ) {
+      return res.status(400).json({
+        error: `Invalid split. Customer paid $${customerPaidAmount}. Refund + worker payout cannot exceed this amount.`,
+      });
+    }
+
+    /* ============================================================
        🧾 STRIPE REFUND HELPER
-    ================================================================ */
+    ============================================================ */
     const processStripeRefund = async (amount) => {
-      if (!job.stripePaymentIntentId) {
-        console.warn("⚠️ No PaymentIntent found");
-        return false;
-      }
+      if (amount <= 0) return;
 
-      try {
-        const paymentIntent = await stripe.paymentIntents.retrieve(
-          job.stripePaymentIntentId
-        );
-        const charge = paymentIntent.latest_charge
-          ? await stripe.charges.retrieve(paymentIntent.latest_charge)
-          : null;
+      await stripe.refunds.create({
+        payment_intent: job.stripePaymentIntentId,
+        amount: Math.round(Math.min(amount, customerPaidAmount) * 100),
+      });
 
-        const paidAmount = charge ? charge.amount / 100 : 0;
-        const safeRefund = Math.min(Number(amount), paidAmount);
-
-        if (safeRefund <= 0) return false;
-
-        await stripe.refunds.create({
-          payment_intent: job.stripePaymentIntentId,
-          amount: Math.round(safeRefund * 100),
-        });
-
-        console.log(`💸 Stripe refund processed: $${safeRefund}`);
-        return true;
-      } catch (err) {
-        console.error("❌ Stripe refund failed:", err);
-        throw new Error("Stripe refund failed");
-      }
+      console.log(`💸 Stripe refund: $${amount}`);
     };
 
-    /* ================================================================
-       💰 WORKER PAYMENT HELPER
-    ================================================================ */
-    const creditWorker = async (amount) => {
-      if (!job.assignedTo) return;
+    /* ============================================================
+       💰 WORKER WALLET CREDIT HELPER
+    ============================================================ */
+    const creditWorker = async (amount, note = "Dispute payout") => {
+      if (!job.assignedTo || amount <= 0) return;
 
-      const worker = await Worker.findById(job.assignedTo);
+      const worker = await Worker.findById(job.assignedTo._id);
       if (!worker) return;
 
       worker.walletBalance = (worker.walletBalance || 0) + Number(amount);
@@ -637,82 +794,91 @@ router.post("/resolve-dispute/:jobId", async (req, res) => {
         jobId: job._id,
         date: new Date(),
         released: true,
-        notes: "Partial dispute payout",
+        notes: note,
       });
 
       await worker.save();
       console.log(`💼 Worker credited: $${amount}`);
     };
 
-    /* ================================================================
+    /* ============================================================
+       📜 UPDATE JOB META
+    ============================================================ */
+    job.paymentInfo = job.paymentInfo || {};
+    job.paymentInfo.escrowStatus = "resolved";
+    job.paymentInfo.paidAmount = customerPaidAmount;
+    job.paymentInfo.lastActionAt = new Date();
+
+    job.history.push({
+      action: "dispute_resolved",
+      by: "admin",
+      at: new Date(),
+      notes: adminNotes || `Resolved as ${resolution}`,
+    });
+
+    let resolutionMessage = "";
+    let workerEmailMsg = "";
+    let customerEmailMsg = "";
+
+    /* ============================================================
        🎯 RESOLUTION OPTIONS
-    ================================================================ */
+    ============================================================ */
 
-    // ⚠️ Full refund to customer (unchanged)
+    // 🔴 FULL REFUND TO CUSTOMER
     if (resolution === "refund_customer") {
-      const totalRefund = job.budget || job.assignedPrice || 0;
-      await processStripeRefund(totalRefund);
+      await processStripeRefund(customerPaidAmount);
 
-      job.paymentStatus = "refunded";
       job.status = "cancelled";
-      job.refundAmount = totalRefund;
+      job.paymentStatus = "refunded";
+      job.refundAmount = customerPaidAmount;
 
-      resolutionMessage = `💸 Full refund of $${totalRefund} issued.`;
-      workerEmailMsg = `Admin resolved the dispute in favor of the customer. No payout released.`;
-      customerEmailMsg = `Your full refund of $${totalRefund} has been processed.`;
+      resolutionMessage = `💸 Full refund of $${customerPaidAmount} issued.`;
+      workerEmailMsg = `Dispute resolved in favor of the customer. No payout released.`;
+      customerEmailMsg = `Your full refund of $${customerPaidAmount} has been processed.`;
     }
 
-    // ⭐ NEW PARTIAL REFUND SYSTEM
+    // 🟡 PARTIAL SPLIT
     if (resolution === "partial_refund") {
-      const customerShare = Math.max(Number(refundAmount) || 0, 0);
-      const workerShare = Math.max(Number(workerAmount) || 0, 0);
+      const refund = Number(refundAmount);
+      const payout = Number(workerAmount);
 
-      // Refund customer (real money)
-      if (customerShare > 0) {
-        await processStripeRefund(customerShare);
-      }
+      if (refund > 0) await processStripeRefund(refund);
+      if (payout > 0)
+        await creditWorker(payout, "Partial dispute payout");
 
-      // Pay worker (wallet credit)
-      if (workerShare > 0) {
-        await creditWorker(workerShare);
-      }
-
-      job.paymentStatus = "partial_refund";
       job.status = "completed";
-      job.refundAmount = customerShare;
-      job.partialWorkerAmount = workerShare;
+      job.paymentStatus = "partial_refund";
+      job.refundAmount = refund;
+      job.workerPaidAmount = payout;
 
-      resolutionMessage = `⚖️ Partial refund: $${customerShare} to customer, $${workerShare} to worker.`;
-
-      workerEmailMsg = `You received $${workerShare} from dispute resolution.`;
-      customerEmailMsg = `You received a partial refund of $${customerShare}.`;
+      resolutionMessage = `⚖️ Partial resolution: $${refund} refunded, $${payout} paid to worker.`;
+      workerEmailMsg = `You received $${payout} from dispute resolution.`;
+      customerEmailMsg = `You received a partial refund of $${refund}.`;
     }
 
-    // 🟢 Release full amount to worker (unchanged)
+    // 🟢 FULL PAYOUT TO WORKER (BID ADJUSTED SAFELY)
     if (resolution === "release_worker") {
-      const worker = await Worker.findById(job.assignedTo);
-      if (worker) {
-        const commission = worker.commissionRate || 0.15;
-        const earning = parseFloat(
-          (job.assignedPrice * (1 - commission)).toFixed(2)
-        );
+      const commission = job.assignedTo.commissionRate || 0.15;
+      const net = parseFloat(
+        (customerPaidAmount * (1 - commission)).toFixed(2)
+      );
 
-        await creditWorker(earning);
-      }
+      await creditWorker(net, "Full dispute payout");
 
-      job.paymentStatus = "released";
       job.status = "completed";
+      job.paymentStatus = "released";
+      job.workerPaidAmount = net;
 
-      resolutionMessage = `💰 Full payout released to worker.`;
-      workerEmailMsg = `Your full payment has been released for "${job.jobTitle}".`;
+      resolutionMessage = `💰 Full payout of $${net} released to worker.`;
+      workerEmailMsg = `Your payment of $${net} has been released.`;
       customerEmailMsg = `The dispute was resolved in favor of the worker.`;
     }
 
     await job.save();
 
-    /* ================================================================
-       📡 REAL-TIME SOCKET EVENTS
-    ================================================================ */
+    /* ============================================================
+       📡 SOCKET EVENTS
+    ============================================================ */
     if (job.customerId?.email) {
       io.to(`customer_${job.customerId.email}`).emit("job:update", {
         jobId: job._id,
@@ -729,18 +895,32 @@ router.post("/resolve-dispute/:jobId", async (req, res) => {
       });
     }
 
-    /* ================================================================
-       ✉️ EMAILS
-    ================================================================ */
+    /* ============================================================
+       ✉️ EMAILS — CUSTOMER, WORKER, ADMIN
+    ============================================================ */
+    await sendEmailSafe({
+      to: "admin@bookyourneed.com",
+      subject: "🚨 Dispute Resolved",
+      html: `
+        <h3>Dispute Resolved</h3>
+        <p><strong>Job:</strong> ${job.jobTitle}</p>
+        <p><strong>Resolution:</strong> ${resolution}</p>
+        <p><strong>Customer Paid:</strong> $${customerPaidAmount}</p>
+        <p><strong>Refund:</strong> $${refundAmount}</p>
+        <p><strong>Worker Payout:</strong> $${workerAmount}</p>
+        <p><strong>Admin Notes:</strong> ${adminNotes || "N/A"}</p>
+      `,
+    });
+
     if (job.assignedTo?.email) {
       await sendEmailSafe({
         to: job.assignedTo.email,
         subject: "📩 Dispute Resolved",
         html: `
-          <h2>Hi ${job.assignedTo.name || "Worker"},</h2>
+          <h2>Hi ${job.assignedTo.name},</h2>
           <p>${workerEmailMsg}</p>
           <p><strong>Admin Notes:</strong> ${adminNotes || "N/A"}</p>
-          <br><p>— Book Your Need</p>
+          <br>— Book Your Need
         `,
       });
     }
@@ -750,10 +930,10 @@ router.post("/resolve-dispute/:jobId", async (req, res) => {
         to: job.customerId.email,
         subject: "📩 Dispute Resolved",
         html: `
-          <h2>Hi ${job.customerId.name || "Customer"},</h2>
+          <h2>Hi ${job.customerId.name},</h2>
           <p>${customerEmailMsg}</p>
           <p><strong>Admin Notes:</strong> ${adminNotes || "N/A"}</p>
-          <br><p>— Book Your Need</p>
+          <br>— Book Your Need
         `,
       });
     }
@@ -765,19 +945,55 @@ router.post("/resolve-dispute/:jobId", async (req, res) => {
     });
   } catch (err) {
     console.error("❌ Dispute resolution failed:", err);
-    res.status(500).json({ error: err.message || "Failed to resolve dispute" });
+    res.status(500).json({ error: err.message });
   }
 });
 
 
-// ✅ Get all active disputes
+// ✅ Get all active disputes (FULL INFO FOR ADMINS)
 router.get("/all-disputes", async (req, res) => {
   try {
     const disputes = await Job.find({ status: "dispute" })
       .populate("customerId", "name email")
-      .populate("assignedTo", "name email")
-      .sort({ createdAt: -1 });
-    res.json(disputes);
+      .populate("assignedTo", "name email commissionRate")
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+
+    const enrichedDisputes = await Promise.all(
+      disputes.map(async (job) => {
+        let customerPaidAmount = 0;
+
+        // 🔐 Get REAL amount paid from Stripe
+        if (job.stripePaymentIntentId) {
+          try {
+            const pi = await stripe.paymentIntents.retrieve(
+              job.stripePaymentIntentId
+            );
+
+            if (pi?.latest_charge) {
+              const charge = await stripe.charges.retrieve(
+                pi.latest_charge
+              );
+              customerPaidAmount = charge.amount / 100;
+            }
+          } catch (err) {
+            console.error(
+              `⚠️ Stripe lookup failed for job ${job._id}:`,
+              err.message
+            );
+          }
+        }
+
+        return {
+          ...job,
+          customerPaidAmount, // ⭐ THIS IS THE KEY FIELD
+        };
+      })
+    );
+
+    res.json(enrichedDisputes);
   } catch (err) {
     console.error("❌ Error fetching disputes:", err);
     res.status(500).json({ error: "Failed to fetch disputes" });
@@ -1118,6 +1334,146 @@ router.post("/rides/auto-complete", async (req, res) => {
   } catch (err) {
     console.error("❌ Auto-complete error:", err);
     res.status(500).json({ error: "Auto-complete process failed" });
+  }
+});
+
+// ============================================================
+// 📧 ADMIN: SEND EMAIL TO CUSTOMER / WORKER
+// POST /api/admin/send-email
+// ============================================================
+router.post("/send-email", async (req, res) => {
+  try {
+    const { to, subject, message, role } = req.body;
+
+    await sendEmailSafe({
+      to,
+      subject,
+      html: `<p>${message.replace(/\n/g, "<br/>")}</p>`,
+    });
+
+    await AdminEmail.create({
+      to,
+      role,
+      subject,
+      message,
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Send email failed:", err);
+    res.status(500).json({ error: "Email failed" });
+  }
+});
+
+// ============================================================
+// 📜 ADMIN: Email History by User
+// ============================================================
+router.get("/email-history/:email", async (req, res) => {
+  const { email } = req.params;
+
+  const history = await AdminEmail.find({ to: email })
+    .sort({ createdAt: -1 })
+    .lean();
+
+  res.json(history);
+});
+
+
+// GET /api/admin/customers/:customerId/details
+router.get("/customers/:customerId/details", async (req, res) => {
+  const { customerId } = req.params;
+
+  try {
+    const customer = await User.findById(customerId).lean();
+    if (!customer) {
+      return res.status(404).json({ message: "Customer not found" });
+    }
+
+    // All jobs for this customer
+    const jobs = await Job.find({ customerId })
+      .populate("assignedTo", "name email")
+      .populate({
+        path: "bids",
+        populate: { path: "workerId", select: "name email" },
+      })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // Build stats
+    const stats = jobs.reduce(
+      (acc, job) => {
+        acc.totalJobs++;
+
+        if (job.status === "completed") acc.completed++;
+        if (job.status === "cancelled") acc.cancelled++;
+        if (["dispute", "disputed"].includes(job.status)) acc.disputed++;
+        if (
+          ["pending", "assigned", "worker_completed", "reopened", "waitlisted"].includes(
+            job.status
+          )
+        ) {
+          acc.active++;
+        }
+
+        const baseAmount =
+          job.assignedPrice ||
+          (job.budget ? Number(job.budget) : 0) ||
+          0;
+
+        acc.totalValue += baseAmount;
+        acc.totalRefunded += job.refundAmount || 0;
+
+        if (job.paymentStatus === "released") {
+          acc.totalReleased += baseAmount - (job.refundAmount || 0);
+        }
+
+        return acc;
+      },
+      {
+        totalJobs: 0,
+        completed: 0,
+        cancelled: 0,
+        disputed: 0,
+        active: 0,
+        totalValue: 0,
+        totalRefunded: 0,
+        totalReleased: 0,
+      }
+    );
+
+    // Shape jobs for the frontend
+    const jobDetails = jobs.map((j) => ({
+      id: j._id,
+      jobTitle: j.jobTitle,
+      description: j.description,
+      status: j.status,
+      paymentStatus: j.paymentStatus,
+      assignedPrice: j.assignedPrice,
+      refundAmount: j.refundAmount,
+      scheduledAt: j.scheduledAt,
+      createdAt: j.createdAt,
+      city: j.city,
+      province: j.province,
+      street: j.street,
+      disputeReason: j.disputeReason,
+      cancelReason: j.cancelReason,
+      assignedWorker: j.assignedTo
+        ? {
+            id: j.assignedTo._id,
+            name: j.assignedTo.name,
+            email: j.assignedTo.email,
+          }
+        : null,
+    }));
+
+    res.json({
+      customer,
+      stats,
+      jobs: jobDetails,
+    });
+  } catch (err) {
+    console.error("❌ Error fetching customer details:", err);
+    res.status(500).json({ message: "Server error" });
   }
 });
 

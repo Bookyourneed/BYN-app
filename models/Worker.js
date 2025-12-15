@@ -98,6 +98,22 @@ const WorkerSchema = new mongoose.Schema(
     badges: [{ label: String, icon: String }],
     portfolio: [{ imageUrl: String, caption: String }],
 
+
+
+// =========================
+// 🔁 PASSWORD RESET (EMAIL OTP)
+// =========================
+   resetOtpHash: {
+     type: String,
+     default: null,
+   },
+
+   resetOtpExpires: {
+     type: Date,
+     default: null,
+   },
+
+
     // 🏅 Worker System Metadata
     status: {
       type: String,

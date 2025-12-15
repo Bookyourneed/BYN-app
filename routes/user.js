@@ -244,6 +244,40 @@ router.post("/verify-email-otp", async (req, res) => {
   }
 });
 
+
+router.post("/change-password", async (req, res) => {
+  try {
+    const { email, currentPassword, newPassword } = req.body;
+
+    // ✅ Validate input
+    if (!email || !currentPassword || !newPassword) {
+      return res.status(400).json({ message: "Missing required fields" });
+    }
+
+    // ✅ Find user
+    const user = await User.findOne({ email });
+    if (!user || !user.password) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // ✅ Check current password
+    const isMatch = await bcrypt.compare(currentPassword, user.password);
+    if (!isMatch) {
+      return res.status(401).json({ message: "Current password incorrect" });
+    }
+
+    // ✅ Hash & save new password
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    user.password = hashedPassword;
+    await user.save();
+
+    res.json({ message: "Password updated successfully" });
+  } catch (error) {
+    console.error("❌ Change password error:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
 // ✅ Save phone number
 router.post("/save-phone", async (req, res) => {
   const { email, phone } = req.body;

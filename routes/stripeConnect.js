@@ -90,8 +90,8 @@ router.post("/refresh-onboarding-link", async (req, res) => {
 
     const accountLink = await stripe.accountLinks.create({
       account: worker.stripeAccountId,
-      refresh_url: `${process.env.FRONTEND_URL}/worker/stripe-refresh`,
-      return_url: `${process.env.FRONTEND_URL}/worker/stripe-success`,
+      refresh_url: `${process.env.WORKER_URL}/worker/stripe-refresh`,
+      return_url: `${process.env.WORKER_URL}/worker/stripe-success`,
       type: "account_onboarding",
     });
 

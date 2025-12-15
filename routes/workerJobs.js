@@ -312,13 +312,24 @@ router.post("/worker-complete/:jobId", async (req, res) => {
     // =====================================================
     // ⚡ Real-time socket events (with fallback handling)
     // =====================================================
-    const customerRoom =
-      job.customerId?.email || `customer_${customerId || job.customerId}`;
-    io.to(customerRoom).emit("job:update", {
-      jobId: job._id,
-      status: "worker_completed",
-      message: `🛠️ ${job.assignedTo.name} marked your job as complete.`,
-    });
+    // Build payload for all listeners
+const payload = {
+  jobId: job._id,
+  status: "worker_completed",
+  message: `🛠️ ${job.assignedTo.name} marked your job as complete.`,
+};
+
+// Emit to EMAIL room
+if (job.customerId?.email) {
+  io.to(`customer_${job.customerId.email}`).emit("job:update", payload);
+  console.log(`📡 Sent job:update → customer_${job.customerId.email}`);
+}
+
+// Emit to ID room
+if (job.customerId?._id) {
+  io.to(`customer_${job.customerId._id}`).emit("job:update", payload);
+  console.log(`📡 Sent job:update → customer_${job.customerId._id}`);
+}
 
     io.to(`worker_${workerId}`).emit("job:update", {
       jobId: job._id,
@@ -537,17 +548,30 @@ router.post("/bids/change", async (req, res) => {
     const job = bid.jobId;
     const customerEmail = job?.customerId?.email;
     if (customerEmail) {
-      io.to(`customer_${customerEmail}`).emit("bid:changeUpdate", {
-        type: "request",
-        jobId: job._id,
-        jobTitle: job.jobTitle,
-        workerName: bid.workerId?.name || "Worker",
-        workerId: bid.workerId?._id,
-        newPrice: newAmount,
-        newEarnings,
-        message: message || "",
-        status: "pending",
-      });
+      const payload = {
+  type: "request",
+  jobId: job._id,
+  jobTitle: job.jobTitle,
+  workerName: bid.workerId?.name || "Worker",
+  workerId: bid.workerId?._id,
+  newPrice: newAmount,
+  newEarnings,
+  message: message || "",
+  status: "pending",
+};
+
+// 🔥 Emit to customer EMAIL room
+if (customerEmail) {
+  io.to(`customer_${customerEmail}`).emit("bid:changeUpdate", payload);
+  console.log(`📡 Sent bid:changeUpdate to customer_${customerEmail}`);
+}
+
+// 🔥 Emit to customer ID room
+if (job.customerId?._id) {
+  io.to(`customer_${job.customerId._id}`).emit("bid:changeUpdate", payload);
+  console.log(`📡 Sent bid:changeUpdate to customer_${job.customerId._id}`);
+}
+
       console.log(`📡 Sent bid:changeUpdate → customer_${customerEmail}`);
     }
 
