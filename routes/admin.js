@@ -705,14 +705,15 @@ router.get('/job/:jobId', async (req, res) => {
   }
 });
 
-// ✅ REAL Stripe Refund + Worker Payout on Dispute Resolution (SAFE)
+// ============================================================
+// ✅ RESOLVE DISPUTE — BID AWARE + WORKER FIRST
+// ============================================================
 router.post("/resolve-dispute/:jobId", async (req, res) => {
   const { jobId } = req.params;
-
   const {
     resolution,        // refund_customer | partial_refund | release_worker
     refundAmount = 0,  // customer refund
-    workerAmount = 0,  // worker payout
+    workerAmount = 0,  // worker payout (gross)
     adminNotes,
   } = req.body;
 
@@ -722,91 +723,88 @@ router.post("/resolve-dispute/:jobId", async (req, res) => {
     const io = getIO();
 
     const job = await Job.findById(jobId)
-      .populate("customerId", "email name")
+      .populate("customerId", "email name stripeCustomerId")
       .populate("assignedTo", "email name commissionRate");
 
     if (!job) return res.status(404).json({ error: "Job not found" });
-    if (job.status !== "dispute") {
+    if (job.status !== "dispute")
       return res.status(400).json({ error: "Job is not under dispute" });
-    }
+    if (!job.stripePaymentIntentId)
+      return res.status(400).json({ error: "No payment intent found" });
 
-    /* ============================================================
-       🔐 GET REAL CUSTOMER PAID AMOUNT (SOURCE OF TRUTH)
-    ============================================================ */
-    let customerPaidAmount = 0;
+    // ============================================================
+    // 🔐 STRIPE — SOURCE OF TRUTH
+    // ============================================================
+    const originalPI = await stripe.paymentIntents.retrieve(
+      job.stripePaymentIntentId
+    );
 
-    if (job.stripePaymentIntentId) {
-      const pi = await stripe.paymentIntents.retrieve(
-        job.stripePaymentIntentId
-      );
-      if (pi?.latest_charge) {
-        const charge = await stripe.charges.retrieve(pi.latest_charge);
-        customerPaidAmount = charge.amount / 100;
-      }
-    }
+    const charge = originalPI.latest_charge
+      ? await stripe.charges.retrieve(originalPI.latest_charge)
+      : null;
 
-    if (customerPaidAmount <= 0) {
-      return res.status(400).json({
-        error: "Unable to determine customer payment amount",
-      });
-    }
+    const customerPaid = charge ? charge.amount / 100 : 0;
+    if (customerPaid <= 0)
+      return res.status(400).json({ error: "Unable to detect customer payment" });
 
-    /* ============================================================
-       🚫 HARD SAFETY CHECK — NEVER EXCEED PAID AMOUNT
-    ============================================================ */
-    if (
-      resolution === "partial_refund" &&
-      Number(refundAmount) + Number(workerAmount) > customerPaidAmount
-    ) {
-      return res.status(400).json({
-        error: `Invalid split. Customer paid $${customerPaidAmount}. Refund + worker payout cannot exceed this amount.`,
-      });
-    }
+    const finalJobPrice = job.assignedPrice;
 
-    /* ============================================================
-       🧾 STRIPE REFUND HELPER
-    ============================================================ */
-    const processStripeRefund = async (amount) => {
-      if (amount <= 0) return;
+    // ============================================================
+    // 💳 CHARGE DIFFERENCE HELPER (REUSED)
+    // ============================================================
+    const chargeCustomerDifference = async (difference) => {
+      if (difference <= 0) return;
 
-      await stripe.refunds.create({
-        payment_intent: job.stripePaymentIntentId,
-        amount: Math.round(Math.min(amount, customerPaidAmount) * 100),
+      const paymentMethod = originalPI.payment_method;
+      if (!paymentMethod)
+        throw new Error("No saved payment method for customer");
+
+      await stripe.paymentIntents.create({
+        amount: Math.round(difference * 100),
+        currency: "cad",
+        customer: job.customerId.stripeCustomerId,
+        payment_method: paymentMethod,
+        off_session: true,
+        confirm: true,
+        description: `Dispute bid adjustment for ${job.jobTitle}`,
+        automatic_payment_methods: {
+          enabled: true,
+          allow_redirects: "never",
+        },
       });
 
-      console.log(`💸 Stripe refund: $${amount}`);
+      console.log(`💳 Charged +$${difference} for dispute adjustment`);
     };
 
-    /* ============================================================
-       💰 WORKER WALLET CREDIT HELPER
-    ============================================================ */
-    const creditWorker = async (amount, note = "Dispute payout") => {
+    // ============================================================
+    // 💰 WORKER CREDIT HELPER
+    // ============================================================
+    const creditWorker = async (amount, note) => {
       if (!job.assignedTo || amount <= 0) return;
 
       const worker = await Worker.findById(job.assignedTo._id);
       if (!worker) return;
 
-      worker.walletBalance = (worker.walletBalance || 0) + Number(amount);
-
+      worker.walletBalance = (worker.walletBalance || 0) + amount;
       worker.walletHistory.push({
         type: "credit",
-        amount: Number(amount),
+        amount,
         jobId: job._id,
         date: new Date(),
         released: true,
         notes: note,
       });
 
+      worker.totalEarnings = (worker.totalEarnings || 0) + amount;
       await worker.save();
-      console.log(`💼 Worker credited: $${amount}`);
     };
 
-    /* ============================================================
-       📜 UPDATE JOB META
-    ============================================================ */
+    // ============================================================
+    // 🧾 JOB META
+    // ============================================================
     job.paymentInfo = job.paymentInfo || {};
     job.paymentInfo.escrowStatus = "resolved";
-    job.paymentInfo.paidAmount = customerPaidAmount;
+    job.paymentInfo.customerPaid = customerPaid;
     job.paymentInfo.lastActionAt = new Date();
 
     job.history.push({
@@ -817,50 +815,75 @@ router.post("/resolve-dispute/:jobId", async (req, res) => {
     });
 
     let resolutionMessage = "";
-    let workerEmailMsg = "";
-    let customerEmailMsg = "";
+    let workerMsg = "";
+    let customerMsg = "";
 
-    /* ============================================================
-       🎯 RESOLUTION OPTIONS
-    ============================================================ */
-
+    // ============================================================
     // 🔴 FULL REFUND TO CUSTOMER
+    // ============================================================
     if (resolution === "refund_customer") {
-      await processStripeRefund(customerPaidAmount);
+      await stripe.refunds.create({
+        payment_intent: job.stripePaymentIntentId,
+        amount: Math.round(customerPaid * 100),
+      });
 
       job.status = "cancelled";
       job.paymentStatus = "refunded";
-      job.refundAmount = customerPaidAmount;
+      job.refundAmount = customerPaid;
 
-      resolutionMessage = `💸 Full refund of $${customerPaidAmount} issued.`;
-      workerEmailMsg = `Dispute resolved in favor of the customer. No payout released.`;
-      customerEmailMsg = `Your full refund of $${customerPaidAmount} has been processed.`;
+      resolutionMessage = `💸 Full refund of $${customerPaid} issued`;
+      workerMsg = "Dispute resolved in favor of customer. No payout released.";
+      customerMsg = `You have been refunded $${customerPaid}.`;
     }
 
-    // 🟡 PARTIAL SPLIT
+    // ============================================================
+    // 🟡 PARTIAL SPLIT (WORKER PROTECTED)
+    // ============================================================
     if (resolution === "partial_refund") {
       const refund = Number(refundAmount);
       const payout = Number(workerAmount);
 
-      if (refund > 0) await processStripeRefund(refund);
-      if (payout > 0)
-        await creditWorker(payout, "Partial dispute payout");
+      const requiredTotal = refund + payout;
+      const difference = Math.max(requiredTotal - customerPaid, 0);
+
+      if (difference > 0) {
+        await chargeCustomerDifference(difference);
+      }
+
+      if (refund > 0) {
+        await stripe.refunds.create({
+          payment_intent: job.stripePaymentIntentId,
+          amount: Math.round(refund * 100),
+        });
+      }
+
+      const commission = job.assignedTo.commissionRate || 0.0445;
+      const net = parseFloat((payout * (1 - commission)).toFixed(2));
+
+      await creditWorker(net, "Partial dispute payout");
 
       job.status = "completed";
       job.paymentStatus = "partial_refund";
       job.refundAmount = refund;
-      job.workerPaidAmount = payout;
+      job.workerPaidAmount = net;
 
-      resolutionMessage = `⚖️ Partial resolution: $${refund} refunded, $${payout} paid to worker.`;
-      workerEmailMsg = `You received $${payout} from dispute resolution.`;
-      customerEmailMsg = `You received a partial refund of $${refund}.`;
+      resolutionMessage = `⚖️ Partial resolution completed`;
+      workerMsg = `You received $${net} after commission.`;
+      customerMsg = `You received a $${refund} refund.`;
     }
 
-    // 🟢 FULL PAYOUT TO WORKER (BID ADJUSTED SAFELY)
+    // ============================================================
+    // 🟢 FULL PAYOUT TO WORKER (BID HONORED)
+    // ============================================================
     if (resolution === "release_worker") {
-      const commission = job.assignedTo.commissionRate || 0.15;
+      const difference = Math.max(finalJobPrice - customerPaid, 0);
+      if (difference > 0) {
+        await chargeCustomerDifference(difference);
+      }
+
+      const commission = job.assignedTo.commissionRate || 0.0445;
       const net = parseFloat(
-        (customerPaidAmount * (1 - commission)).toFixed(2)
+        (finalJobPrice * (1 - commission)).toFixed(2)
       );
 
       await creditWorker(net, "Full dispute payout");
@@ -869,82 +892,145 @@ router.post("/resolve-dispute/:jobId", async (req, res) => {
       job.paymentStatus = "released";
       job.workerPaidAmount = net;
 
-      resolutionMessage = `💰 Full payout of $${net} released to worker.`;
-      workerEmailMsg = `Your payment of $${net} has been released.`;
-      customerEmailMsg = `The dispute was resolved in favor of the worker.`;
+      resolutionMessage = `💰 Full payout of $${net} released to worker`;
+      workerMsg = `Your payment of $${net} has been released.`;
+      customerMsg = `Dispute resolved in favor of worker.`;
     }
 
     await job.save();
 
-    /* ============================================================
-       📡 SOCKET EVENTS
-    ============================================================ */
-    if (job.customerId?.email) {
-      io.to(`customer_${job.customerId.email}`).emit("job:update", {
-        jobId: job._id,
-        status: job.status,
-        message: resolutionMessage,
-      });
-    }
-
-    if (job.assignedTo?._id) {
-      io.to(`worker_${job.assignedTo._id}`).emit("job:update", {
-        jobId: job._id,
-        status: job.status,
-        message: resolutionMessage,
-      });
-    }
-
-    /* ============================================================
-       ✉️ EMAILS — CUSTOMER, WORKER, ADMIN
-    ============================================================ */
-    await sendEmailSafe({
-      to: "admin@bookyourneed.com",
-      subject: "🚨 Dispute Resolved",
-      html: `
-        <h3>Dispute Resolved</h3>
-        <p><strong>Job:</strong> ${job.jobTitle}</p>
-        <p><strong>Resolution:</strong> ${resolution}</p>
-        <p><strong>Customer Paid:</strong> $${customerPaidAmount}</p>
-        <p><strong>Refund:</strong> $${refundAmount}</p>
-        <p><strong>Worker Payout:</strong> $${workerAmount}</p>
-        <p><strong>Admin Notes:</strong> ${adminNotes || "N/A"}</p>
-      `,
-    });
-
-    if (job.assignedTo?.email) {
-      await sendEmailSafe({
-        to: job.assignedTo.email,
-        subject: "📩 Dispute Resolved",
-        html: `
-          <h2>Hi ${job.assignedTo.name},</h2>
-          <p>${workerEmailMsg}</p>
-          <p><strong>Admin Notes:</strong> ${adminNotes || "N/A"}</p>
-          <br>— Book Your Need
-        `,
-      });
-    }
-
-    if (job.customerId?.email) {
-      await sendEmailSafe({
-        to: job.customerId.email,
-        subject: "📩 Dispute Resolved",
-        html: `
-          <h2>Hi ${job.customerId.name},</h2>
-          <p>${customerEmailMsg}</p>
-          <p><strong>Admin Notes:</strong> ${adminNotes || "N/A"}</p>
-          <br>— Book Your Need
-        `,
-      });
-    }
-
-    res.json({
-      success: true,
+    // ============================================================
+    // 📡 SOCKETS
+    // ============================================================
+    io.to(`worker_${job.assignedTo._id}`).emit("job:update", {
+      jobId: job._id,
+      status: job.status,
       message: resolutionMessage,
-      job,
     });
+
+    io.to(`customer_${job.customerId.email}`).emit("job:update", {
+      jobId: job._id,
+      status: job.status,
+      message: resolutionMessage,
+    });
+    // ============================================================
+// ✉️ EMAILS — ADMIN / WORKER / CUSTOMER (POLITE + NEUTRAL)
+// ============================================================
+
+// 🔔 Admin notification (internal – full details)
+await sendEmailSafe({
+  to: "admin@bookyourneed.com",
+  subject: "📌 Dispute Resolved – Internal Record",
+  html: `
+    <h3>Dispute Resolution Summary</h3>
+    <p><strong>Job Title:</strong> ${job.jobTitle}</p>
+    <p><strong>Resolution Type:</strong> ${resolution}</p>
+    <p><strong>Handled By:</strong> Admin</p>
+    <p><strong>Customer Paid:</strong> $${customerPaid}</p>
+    <p><strong>Final Job Price:</strong> $${finalJobPrice}</p>
+    <p><strong>Admin Notes:</strong></p>
+    <p>${adminNotes || "No additional notes provided."}</p>
+  `,
+});
+
+// 👷 Worker email (no amounts, respectful tone)
+if (job.assignedTo?.email) {
+  await sendEmailSafe({
+    to: job.assignedTo.email,
+    subject: "📩 Update on Your Job Dispute",
+    html: `
+      <h2>Hello ${job.assignedTo.name || "there"},</h2>
+
+      <p>
+        Thank you for your patience while our team carefully reviewed the dispute
+        related to your recent job on <strong>Book Your Need</strong>.
+      </p>
+
+      <p>
+        After reviewing the job details, communication history, and information
+        provided by both parties, we’ve reached a resolution in line with our
+        platform policies.
+      </p>
+
+      <p>
+        Any applicable updates related to your earnings have now been processed
+        and will reflect in your wallet accordingly.
+      </p>
+
+      <p>
+        If you have any questions or would like further clarification, our support
+        team is always here to help.
+      </p>
+
+      <br />
+      <p>
+        We appreciate your professionalism and the work you contribute to the
+        Book Your Need platform.
+      </p>
+
+      <p>
+        Best regards,<br />
+        <strong>Book Your Need Support Team</strong>
+      </p>
+    `,
+  });
+}
+
+// 🙋 Customer email (no amounts, calm + reassuring)
+if (job.customerId?.email) {
+  await sendEmailSafe({
+    to: job.customerId.email,
+    subject: "📩 Update on Your Book Your Need Job",
+    html: `
+      <h2>Hello ${job.customerId.name || "there"},</h2>
+
+      <p>
+        Thank you for your patience while we carefully reviewed your recent job
+        on <strong>Book Your Need</strong>.
+      </p>
+
+      <p>
+        Our support team has completed a full review of the job details and the
+        information shared by both parties.
+      </p>
+
+      <p>
+        Based on this review, we’ve reached a resolution that aligns with our
+        platform policies and the work completed.
+      </p>
+
+      <p>
+        Any applicable updates related to your payment have been processed and
+        will be reflected automatically through your original payment method.
+      </p>
+
+      <p>
+        If you have questions or believe additional details should be considered,
+        please don’t hesitate to contact our support team — we’re here to help.
+      </p>
+
+      <br />
+      <p>
+        Thank you for being part of the Book Your Need community.
+      </p>
+
+      <p>
+        Warm regards,<br />
+        <strong>Book Your Need Support Team</strong>
+      </p>
+    `,
+  });
+}
+
+return res.json({
+  success: true,
+  message: resolutionMessage,
+  job,
+});
+
+
   } catch (err) {
-    console.error("❌ Dispute resolution failed:", err);
+    console.error("❌ Resolve dispute failed:", err);
     res.status(500).json({ error: err.message });
   }
 });
